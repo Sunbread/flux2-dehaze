@@ -1,0 +1,36 @@
+# ===== Model =====
+model_name: "black-forest-labs/FLUX.2-klein-base-9B"
+lora_target: "both"           # "qwen" | "transformer" | "both"
+lora_rank: 16
+lora_alpha: 8
+
+# ===== Training =====
+seed: 42
+batch_size: 1                 # per-device batch (80GB A100 limit)
+gradient_accumulation_steps: 32  # effective batch = 1 x 32 = 32
+max_steps: 1500               # optimizer steps
+transformer_lr: 1e-3           # Muon learning rate for transformer LoRA
+qwen_lr: 1e-3                  # Muon learning rate for Qwen3 LoRA
+weight_decay: 0.01
+transformer_grad_clip: 1.0     # max grad norm for transformer LoRA
+qwen_grad_clip: 1.0            # max grad norm for Qwen3 LoRA
+caption_dropout_rate: 0.1     # 10% empty prompt
+max_sequence_length: 512
+
+# ===== Inference =====
+guidance_scale: 3.5
+num_inference_steps: 28
+
+# ===== Data =====
+train_metadata: "data/RESIDE/processed/metadata_train.jsonl"
+val_metadata: "data/NH-HAZE/processed/metadata.jsonl"
+
+# ===== Checkpointing =====
+output_dir: "outputs/checkpoints"
+save_every: 250
+log_freq: 10
+
+# ===== wandb =====
+wandb_project: "dehaze-flux2-klein"
+wandb_entity: null
+wandb_mode: "online"          # "online" | "offline" | "disabled"

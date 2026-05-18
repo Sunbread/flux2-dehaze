@@ -1,0 +1,17 @@
+.venv/
+uv_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+outputs/checkpoints/
+outputs/logs/
+*.pt
+*.bin
+*.safetensors
+wandb/
+.DS_Store
+*.swp
+*.swo

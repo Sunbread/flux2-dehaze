@@ -111,9 +111,10 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
     t_has_lora = lora_target in ("transformer", "both")
     q_has_lora = lora_target in ("qwen", "both")
 
-    transformer_opt = create_optimizer(transformer, lr=transformer_lr, weight_decay=wd) \
+    momentum = config.get("momentum", 0.95)
+    transformer_opt = create_optimizer(transformer, lr=transformer_lr, weight_decay=wd, momentum=momentum) \
         if t_has_lora else None
-    qwen_opt = create_optimizer(text_encoder, lr=qwen_lr, weight_decay=wd) \
+    qwen_opt = create_optimizer(text_encoder, lr=qwen_lr, weight_decay=wd, momentum=momentum) \
         if q_has_lora else None
 
     if transformer_opt is not None:

@@ -1,13 +1,14 @@
 .venv/
 uv_cache/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
 build/
-outputs/checkpoints/
-outputs/logs/
+data/
+outputs/
 *.pt
 *.bin
 *.safetensors

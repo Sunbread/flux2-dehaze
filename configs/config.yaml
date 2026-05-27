@@ -6,12 +6,13 @@ lora_alpha: 8
 
 # ===== Training =====
 seed: 42
-batch_size: 1                 # per-device batch (80GB A100 limit)
-gradient_accumulation_steps: 32  # effective batch = 1 x 32 = 32
+batch_size: 2                 # per-device batch
+gradient_accumulation_steps: 16  # effective batch = 2 x 16 = 32
 max_steps: 1500               # optimizer steps
 transformer_lr: 1e-3           # Muon learning rate for transformer LoRA
-qwen_lr: 1e-3                  # Muon learning rate for Qwen3 LoRA
+qwen_lr: 1e-4                  # Muon learning rate for Qwen3 LoRA
 weight_decay: 0.01
+momentum: 0.95
 transformer_grad_clip: 1.0     # max grad norm for transformer LoRA
 qwen_grad_clip: 1.0            # max grad norm for Qwen3 LoRA
 caption_dropout_rate: 0.1     # 10% empty prompt

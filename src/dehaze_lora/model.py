@@ -198,7 +198,10 @@ def encode_vae_image(vae, image: torch.Tensor) -> torch.Tensor:
     Flux2 VAE: 32ch, 8x downscale → patchify → 128ch, 16x downscale.
     BN normalization uses the VAE's internal BatchNorm running stats —
     required by the transformer which expects zero-mean unit-variance latents.
+
+    VAE expects input in [-1, 1]; image is normalized from [0, 1].
     """
+    image = image * 2.0 - 1.0  # [0, 1] → [-1, 1]
     latents = vae.encode(image).latent_dist.sample()
     latents = _patchify_latents(latents)
 
@@ -219,7 +222,9 @@ def decode_vae_image(vae, latents: torch.Tensor) -> torch.Tensor:
     ).to(latents.device, latents.dtype)
     latents = latents * bn_std + bn_mean
     latents = _unpatchify_latents(latents)
-    return vae.decode(latents).sample
+    image = vae.decode(latents).sample
+    image = (image + 1.0) / 2.0  # [-1, 1] → [0, 1]
+    return image
 
 
 def encode_prompt(

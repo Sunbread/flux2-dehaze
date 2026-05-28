@@ -248,7 +248,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
         config=config,
     )
 
-    def _validate_and_save():
+    def _validate_and_save(save=True):
         nonlocal global_step, micro_step
 
         # Run validation (before saving checkpoint)
@@ -317,14 +317,15 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
                 )
 
         # Save checkpoint
-        rng_state = get_rng_state()
-        save_checkpoint(
-            transformer, text_encoder, global_step, output_dir,
-            global_step=global_step, micro_step=micro_step,
-            rng_state=rng_state,
-            transformer_opt=transformer_opt, qwen_opt=qwen_opt,
-            config=config,
-        )
+        if save:
+            rng_state = get_rng_state()
+            save_checkpoint(
+                transformer, text_encoder, global_step, output_dir,
+                global_step=global_step, micro_step=micro_step,
+                rng_state=rng_state,
+                transformer_opt=transformer_opt, qwen_opt=qwen_opt,
+                config=config,
+            )
 
     print(
         f"Training: {max_steps} steps, batch={config['batch_size']}, "
@@ -335,6 +336,9 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
     step_uncond = 0
     step_total = 0
     step_loss = 0.0
+
+    # Sanity validation before any training (step 0)
+    _validate_and_save(save=False)
 
     with tqdm(
         total=max_steps, initial=global_step,
@@ -363,14 +367,14 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
             prompt_embeds = prompt_embeds.to(transformer_device)
             text_ids = text_ids.to(transformer_device)
 
-            # Timestep and noise
+            # Timestep and noise (logit-normal + shift, matching Flux2 Klein training)
+            # RNG: Generator(seed + micro_step) — deterministic per micro-batch
             bsz = gt_latent.shape[0]
+            shift = scheduler.config.shift  # 3.0 for Flux2 Klein Base
             rng = torch.Generator(transformer_device).manual_seed(seed + micro_step)
-            t = torch.randint(
-                0, scheduler.config.num_train_timesteps, (bsz,),
-                generator=rng, device=transformer_device,
-            ).long()
-            sigmas = t.float() / scheduler.config.num_train_timesteps
+            z = torch.randn(bsz, generator=rng, device=transformer_device, dtype=torch.float32)
+            sigma_raw = torch.sigmoid(z)  # logit-normal: sigmoid(N(0, 1))
+            sigmas = (sigma_raw * shift) / (1 + (shift - 1) * sigma_raw)
 
             noise = torch.randn(
                 gt_latent.shape, generator=rng,

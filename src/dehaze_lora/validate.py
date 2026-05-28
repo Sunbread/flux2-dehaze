@@ -16,6 +16,7 @@ from .model import (
     encode_prompt, encode_vae_image, decode_vae_image,
     patchify_and_make_ids, unpatchify,
 )
+from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
 
 
 def load_inference_models(
@@ -91,7 +92,9 @@ def dehaze_single(
     )
 
     # Start from pure noise
-    scheduler.set_timesteps(num_inference_steps)
+    image_seq_len = hazy_latent.shape[2] * hazy_latent.shape[3]
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    scheduler.set_timesteps(num_inference_steps, mu=mu)
     z = torch.randn_like(hazy_latent)
 
     for t in tqdm(scheduler.timesteps, desc="Denoising"):
@@ -182,13 +185,21 @@ def _denoise_all_modes(
     )
 
     # Shared starting noise
-    scheduler.set_timesteps(num_inference_steps)
+    image_seq_len = hazy_latent.shape[2] * hazy_latent.shape[3]
+    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
     rng = torch.Generator(device).manual_seed(noise_seed)
     z0 = torch.randn_like(hazy_latent, generator=rng)
 
+    def _fresh_scheduler():
+        from diffusers import FlowMatchEulerDiscreteScheduler
+        sched = FlowMatchEulerDiscreteScheduler.from_config(scheduler.config)
+        sched.set_timesteps(num_inference_steps, mu=mu)
+        return sched
+
     # --- Mode 1: Conditional generation (prompt only, no CFG) ---
+    sched = _fresh_scheduler()
     z_cond = z0.clone()
-    for t in scheduler.timesteps:
+    for t in tqdm(sched.timesteps, desc="Cond", leave=False):
         timestep = (
             t.float().unsqueeze(0).expand(B)
             .to(device=device, dtype=torch.bfloat16)
@@ -208,12 +219,13 @@ def _denoise_all_modes(
             )[0]
         v = v[:, : noisy_tokens.shape[1], :]
         v = unpatchify(v, ph, pw, patch_size=patch_size)
-        z_cond = scheduler.step(v, t, z_cond).prev_sample
+        z_cond = sched.step(v, t, z_cond).prev_sample
     cond_img = decode_vae_image(vae, z_cond)
 
     # --- Mode 2: Reconstruction (uncond only) ---
+    sched = _fresh_scheduler()
     z_recon = z0.clone()
-    for t in scheduler.timesteps:
+    for t in tqdm(sched.timesteps, desc="Recon", leave=False):
         timestep = (
             t.float().unsqueeze(0).expand(B)
             .to(device=device, dtype=torch.bfloat16)
@@ -233,12 +245,13 @@ def _denoise_all_modes(
             )[0]
         v = v[:, : noisy_tokens.shape[1], :]
         v = unpatchify(v, ph, pw, patch_size=patch_size)
-        z_recon = scheduler.step(v, t, z_recon).prev_sample
+        z_recon = sched.step(v, t, z_recon).prev_sample
     recon_img = decode_vae_image(vae, z_recon)
 
     # --- Mode 3: CFG ---
+    sched = _fresh_scheduler()
     z_cfg = z0.clone()
-    for t in scheduler.timesteps:
+    for t in tqdm(sched.timesteps, desc="CFG", leave=False):
         timestep = (
             t.float().unsqueeze(0).expand(B)
             .to(device=device, dtype=torch.bfloat16)
@@ -275,7 +288,7 @@ def _denoise_all_modes(
         v_uncond = unpatchify(v_uncond, ph, pw, patch_size=patch_size)
 
         v_cfg = v_uncond + guidance_scale * (v_cond - v_uncond)
-        z_cfg = scheduler.step(v_cfg, t, z_cfg).prev_sample
+        z_cfg = sched.step(v_cfg, t, z_cfg).prev_sample
     cfg_img = decode_vae_image(vae, z_cfg)
 
     return {"cond": cond_img, "reconstruction": recon_img, "cfg": cfg_img}

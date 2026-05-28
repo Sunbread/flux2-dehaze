@@ -22,7 +22,7 @@ src/dehaze_lora/
   model.py        # Model loading, LoRA injection, VAE encode/decode, text encoding, patchify/unpatchify
   loss.py         # Flow-matching MSE loss: target = noise - clean_latent
   optimizer.py    # Muon optimizer wrapper (2D-param constraint, match_rms_adamw LR adjustment)
-  train.py        # Training loop with Accelerate, gradient accumulation, checkpointing, wandb logging
+  train.py        # Training loop with raw PyTorch, gradient accumulation, checkpointing, wandb logging
   validate.py     # Inference with two-pass CFG, PSNR/SSIM evaluation
   dataset.py      # DehazeDataset (10% caption dropout for CFG) and DehazeValDataset
   preprocess.py   # RESIDE and NH-HAZE dataset preprocessing pipeline
@@ -38,7 +38,7 @@ src/dehaze_lora/
 5. Patchify: noisy (index=0.0) + hazy ref (index=10.0) concatenated as image tokens
 6. Transformer forward -> extract noisy token outputs -> unpatchify
 7. Flow-matching loss: MSE(model_pred, noise - GT_latent)
-8. Gradient accumulation with `accelerator.accumulate(transformer)`, separate optimizers per model
+8. Gradient accumulation via manual `loss / grad_accum`, separate optimizers per model
 
 ### Inference (CFG Two-Pass)
 
@@ -104,8 +104,8 @@ These come from the actual FLUX.2 Klein model config and ComfyUI source. Changin
 
 These bugs produced no errors but silently broke training. Tests now catch them. Do NOT reintroduce any of these patterns.
 
-### 1. Gradient Accumulation Must Use `accelerator.accumulate()`
-The forward+backward+step block MUST be wrapped in `with accelerator.accumulate(transformer):`. Without it, `accelerator.sync_gradients` is always True, every micro-batch triggers `optimizer.step()`, and `gradient_accumulation_steps` has zero effect. The effective batch size silently becomes 1 instead of 32.
+### 1. Gradient Accumulation Uses Manual `loss / grad_accum`
+The loss MUST be divided by `gradient_accumulation_steps` before `backward()`. Without scaling, each micro-batch's gradients accumulate additively and effectively multiply the LR by `gradient_accumulation_steps`.
 
 ### 2. Qwen LoRA Needs Gradient Tracking in `encode_prompt`
 When Qwen has LoRA (lora_target="qwen" or "both"), `encode_prompt` must NOT be inside `torch.no_grad()`. The text encoder forward needs gradient tracking for its LoRA params. Current pattern:
@@ -116,13 +116,8 @@ with ctx:
 ```
 VAE encoding ALWAYS stays in `no_grad()` -- VAE is frozen and always has BatchNorm in eval mode during training.
 
-### 3. Unwrap Before `isinstance` Check
-`accelerator.prepare()` may wrap models (e.g., with DeepSpeed or DDP wrappers). `isinstance(wrapped_model, PeftModel)` returns False even when the underlying model IS a PeftModel. Always unwrap first:
-```python
-unwrapped = accelerator.unwrap_model(text_encoder)
-if isinstance(unwrapped, PeftModel):
-    unwrapped.save_pretrained(path)
-```
+### 3. No Model Wrapping — Direct `PeftModel` Access
+Without accelerate's `prepare()`, models are never wrapped in DDP/DeepSpeed. `isinstance(model, PeftModel)` works directly. `save_pretrained()` works directly.
 
 ### 4. Optimizer Creation Must Be Conditional on `lora_target`
 If `lora_target="qwen"`, the transformer has no LoRA -> no trainable params -> `create_optimizer` raises `ValueError`. Same for `lora_target="transformer"` and Qwen. Create optimizers conditionally:
@@ -147,6 +142,9 @@ Past bugs: `target_size` accepted by dataset constructor but never passed from c
 
 ### 8. Timestep Shape Is (B,) Not (B, 1)
 The Flux2 transformer expects 1D timestep tensors of shape (B,). Passing `.unsqueeze(1)` -- shape (B, 1) -- will silently cause shape errors downstream.
+
+### 9. Device Placement — `transformer_device` vs `qwen_device`
+VAE + transformer go to `transformer_device` (cuda:0). Qwen3 goes to `qwen_device` (cuda:1). `prompt_embeds` and `text_ids` must be `.to(transformer_device)` before passing to the transformer. Autograd handles gradient routing across devices via CopyBackwards. When both devices are the same (single-GPU mode), `.to()` is a no-op.
 
 ## Test Structure
 
@@ -220,6 +218,7 @@ LoRA (rank=16, alpha=8):
 | LoRA + opt + grads | ~0.3 GB | ~0.2 GB | ~0.4 GB |
 | CUDA overhead | ~3 GB | ~3 GB | ~3 GB |
 | **Peak** | **~46 GB** | **~48 GB** | **~48 GB** |
+| **2x40GB Peak (GPU0/GPU1)** | **~25 GB / ~23 GB** | **~25 GB / ~25 GB** | **~25 GB / ~25 GB** |
 
 ### Why transformer activations always cost ~8 GB
 
@@ -241,7 +240,7 @@ Activations scale roughly linearly with batch_size. With bs=2 (current default),
 ## Code Conventions
 
 - **dtype**: `torch.bfloat16` throughout for all model weights and activations. VAE BN stats cast to match latent dtype/device.
-- **Device management**: Models moved to device explicitly in `load_models` and `.to(device)` calls. Accelerate handles device placement for prepared models.
+- **Device management**: Transformer+VAE on `transformer_device` (cuda:0), Qwen3 on `qwen_device` (cuda:1). Cross-device autograd via `.to()` CopyBackwards — no manual gradient sync. Single-GPU: set both devices to `"cuda:0"` — `.to()` is a no-op.
 - **Seed determinism**: Training uses a master seed (42) with `micro_step` added for per-batch unique RNG. DataLoader workers seed from `seed + worker_id`.
 - **Imports**: No wildcard imports. Module-level imports in standard order: stdlib -> third-party -> project.
 - **Type annotations**: Partial — public function signatures are annotated, internal helpers may not be. Not enforced by a type checker.
@@ -254,4 +253,4 @@ Activations scale roughly linearly with batch_size. With bs=2 (current default),
 2. **New LoRA target?** Add module names to `QWEN_LORA_MODULES` or `TRANSFORMER_LORA_MODULES` in `model.py`. Verify they exist on the real model.
 3. **Changing training logic?** Add a synthetic CPU test first that exercises the new path. The synthetic tests catch silent failures without needing GPU time.
 4. **New model component?** Respect the VRAM limits -- load one large model per test, never keep transformer + Qwen3 in GPU simultaneously in tests.
-5. **Prefer `accelerate` APIs**: Use `accelerator.prepare()`, `accelerator.backward()`, `accelerator.clip_grad_norm_()`, etc. Do not call `loss.backward()` or `torch.nn.utils.clip_grad_norm_()` directly.
+5. **Use raw PyTorch APIs**: Use `loss.backward()`, `torch.nn.utils.clip_grad_norm_()`, and `torch.cuda.amp.autocast(dtype=torch.bfloat16)`. Models are placed manually — no `prepare()` or `unwrap_model()`.

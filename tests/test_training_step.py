@@ -105,6 +105,37 @@ class TestSyntheticTrainingStep:
             assert not torch.allclose(p, initial[name], atol=1e-6), \
                 f"Parameter {name} did not change after 2 optimizer steps"
 
+    def test_cross_device_autograd(self):
+        """Gradients flow through .to() CopyBackwards across devices."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        if torch.cuda.device_count() < 2:
+            pytest.skip("Need 2 GPUs for cross-device test")
+
+        class ModelOnGPU1(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(8, 8))
+
+            def forward(self, x):
+                return x @ self.weight
+
+        model = ModelOnGPU1().to("cuda:1")
+        init_weight = model.weight.clone()
+
+        x = torch.randn(4, 8, device="cuda:1")
+
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=False):
+            y = model(x).to("cuda:0")  # CopyBackwards recorded here
+            loss = y.sum()
+
+        loss.backward()
+
+        assert model.weight.grad is not None, \
+            "Gradient should flow across devices via CopyBackwards"
+        assert not torch.allclose(model.weight.grad, torch.zeros_like(model.weight.grad))
+        assert torch.allclose(model.weight, init_weight)  # weight not yet updated
+
 
 # ---------------------------------------------------------------------------
 # Real model training step (GPU, very careful VRAM)

@@ -152,7 +152,8 @@ class TestLoRATargetSelection:
         try:
             models = load_models(
                 model_name=MODEL_NAME, lora_target="transformer",
-                lora_rank=4, lora_alpha=8, device="cuda",
+                lora_rank=4, lora_alpha=8,
+                transformer_device="cuda", qwen_device="cuda",
             )
         except Exception as e:
             pytest.skip(f"Models not available: {e}")

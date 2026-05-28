@@ -1,4 +1,5 @@
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux2Transformer2DModel
 from peft import PeftModel
@@ -107,28 +108,30 @@ def dehaze_single(
         )
 
         # Conditional forward
-        v_cond = transformer(
-            hidden_states=img_hidden,
-            encoder_hidden_states=cond_embeds,
-            timestep=timestep,
-            img_ids=img_ids_combined,
-            txt_ids=cond_text_ids,
-            return_dict=False,
-        )[0]
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            v_cond = transformer(
+                hidden_states=img_hidden,
+                encoder_hidden_states=cond_embeds,
+                timestep=timestep,
+                img_ids=img_ids_combined,
+                txt_ids=cond_text_ids,
+                return_dict=False,
+            )[0]
         v_cond = v_cond[:, : noisy_tokens.shape[1], :]
         v_cond = unpatchify(
             v_cond, z.shape[2], z.shape[3], patch_size=patch_size,
         )
 
         # Unconditional forward
-        v_uncond = transformer(
-            hidden_states=img_hidden,
-            encoder_hidden_states=uncond_embeds,
-            timestep=timestep,
-            img_ids=img_ids_combined,
-            txt_ids=uncond_text_ids,
-            return_dict=False,
-        )[0]
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            v_uncond = transformer(
+                hidden_states=img_hidden,
+                encoder_hidden_states=uncond_embeds,
+                timestep=timestep,
+                img_ids=img_ids_combined,
+                txt_ids=uncond_text_ids,
+                return_dict=False,
+            )[0]
         v_uncond = v_uncond[:, : noisy_tokens.shape[1], :]
         v_uncond = unpatchify(
             v_uncond, z.shape[2], z.shape[3], patch_size=patch_size,

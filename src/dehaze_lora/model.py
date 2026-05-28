@@ -30,24 +30,32 @@ def load_models(
     lora_target: str = "both",
     lora_rank: int = 16,
     lora_alpha: int = 8,
-    device: str = "cuda",
+    transformer_device: str = "cuda:0",
+    qwen_device: str = "cuda:1",
+    gradient_checkpointing: bool = False,
 ):
+    # VAE (always on transformer device, always frozen)
     vae = AutoencoderKLFlux2.from_pretrained(
         model_name, subfolder="vae", torch_dtype=torch.bfloat16
     )
     vae.requires_grad_(False)
-    vae.to(device)
+    vae.to(transformer_device)
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_name, subfolder="scheduler"
     )
 
+    # Transformer on its own device
     transformer = Flux2Transformer2DModel.from_pretrained(
         model_name,
         subfolder="transformer",
         torch_dtype=torch.bfloat16,
     )
     transformer.requires_grad_(False)
+
+    if gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+        print("Gradient checkpointing enabled on transformer")
 
     if lora_target in ("transformer", "both"):
         transformer = _inject_lora(
@@ -58,6 +66,9 @@ def load_models(
         )
         print(f"Transformer LoRA injected: rank={lora_rank}, alpha={lora_alpha}")
 
+    transformer.to(transformer_device)
+
+    # Qwen3 on its own device
     text_encoder = Qwen3ForCausalLM.from_pretrained(
         model_name, subfolder="text_encoder", torch_dtype=torch.bfloat16
     )
@@ -71,6 +82,8 @@ def load_models(
             target_modules=QWEN_LORA_MODULES,
         )
         print(f"Qwen3 LoRA injected: rank={lora_rank}, alpha={lora_alpha}")
+
+    text_encoder.to(qwen_device)
 
     tokenizer = Qwen2TokenizerFast.from_pretrained(
         model_name, subfolder="tokenizer"
@@ -217,26 +230,37 @@ def encode_prompt(
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
-    """
-    Encode prompt → (prompt_embeds, text_ids).
+    """Encode a single prompt. Use encode_prompts for batched encoding."""
+    return encode_prompts(text_encoder, tokenizer, [prompt], max_seq_len, device, dtype)
 
-    Uses Qwen3 chat template and concatenates hidden states from layers
+
+def encode_prompts(
+    text_encoder,
+    tokenizer,
+    prompts: list[str],
+    max_seq_len: int = 512,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """
+    Batch-encode prompts → (prompt_embeds, text_ids).
+
+    Applies Qwen3 chat template, tokenizes with padding, runs a single
+    batched forward pass, and concatenates hidden states from layers
     (9, 18, 27) → joint_attention_dim (12288).
-
-    Empty prompts (used for CFG unconditional branch) also go through
-    the chat template — they produce non-empty token sequences with
-    the template structure wrapped around empty user content.
     """
-    messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    texts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        for p in prompts
+    ]
 
     tokens = tokenizer(
-        text,
+        texts,
         max_length=max_seq_len,
         padding="max_length",
         truncation=True,

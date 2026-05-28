@@ -164,6 +164,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
 
     step_uncond = 0
     step_total = 0
+    step_loss = 0.0
 
     with tqdm(total=max_steps, desc="Training", unit="step", dynamic_ncols=True) as pbar:
         while global_step < max_steps:
@@ -240,9 +241,10 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
                     )
 
                     loss = flow_matching_loss(v_theta, gt_latent, noise)
-                    loss = loss / grad_accum  # normalize for accumulation
+                    loss_scaled = loss / grad_accum  # normalize for accumulation
 
-                loss.backward()
+                loss_scaled.backward()
+                step_loss += loss.detach()
                 micro_step += 1
 
                 if micro_step % grad_accum == 0:
@@ -261,19 +263,21 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
                         qwen_opt.zero_grad()
 
                     global_step += 1
+                    avg_loss = (step_loss / grad_accum).item()
                     pbar.update(1)
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}")
 
                     if global_step % log_freq == 0:
                         cond_ratio = 1.0 - step_uncond / max(step_total, 1)
                         log_dict = {
-                            "train/loss": loss.item(),
+                            "train/loss": avg_loss,
                             "train/cond_ratio": cond_ratio,
                             "train/transformer_lr": transformer_lr,
                             "train/step": global_step,
                         }
                         step_uncond = 0
                         step_total = 0
+                        step_loss = 0.0
                         if qwen_opt is not None:
                             log_dict["train/qwen_lr"] = qwen_lr
                         wandb.log(log_dict, step=global_step)
@@ -286,6 +290,9 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
 
                 if global_step >= max_steps:
                     break
+
+    if global_step % save_every != 0:
+        save_checkpoint(transformer, text_encoder, global_step, output_dir)
 
     wandb.finish()
     print("Training complete.")

@@ -43,3 +43,9 @@ log_freq: 10
 wandb_project: "dehaze-flux2-klein"
 wandb_entity: null
 wandb_mode: "online"          # "online" | "offline" | "disabled"
+
+# ===== Validation =====
+val_split: 0.05               # fraction of RESIDE held out for validation
+val_subset_size: 4             # images per validation run
+val_guidance_scale: 3.5        # CFG scale during validation
+val_num_inference_steps: 28    # denoising steps during validation

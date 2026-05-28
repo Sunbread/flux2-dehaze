@@ -1,4 +1,5 @@
 import contextlib
+import json
 import random
 from typing import Optional
 
@@ -18,6 +19,7 @@ from .optimizer import create_optimizer
 from .checkpoint import (
     get_rng_state, set_rng_state, save_checkpoint, load_training_state,
 )
+from .validate import run_validation_batch
 from peft import PeftModel
 
 
@@ -43,6 +45,20 @@ def _training_batches(train_loader, skip=0):
         except StopIteration:
             it = iter(train_loader)
             yield next(it)
+
+
+def _select_val_subset(val_metadata: list, k: int, seed: int) -> list:
+    """Deterministic subset selection from validation set."""
+    import hashlib
+    if len(val_metadata) <= k:
+        return val_metadata
+    indices = list(range(len(val_metadata)))
+    key = f"{seed}".encode()
+    ranked = sorted(
+        indices,
+        key=lambda i: hashlib.md5(key + str(i).encode()).hexdigest(),
+    )
+    return [val_metadata[i] for i in ranked[:k]]
 
 
 def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Optional[str] = None):
@@ -114,13 +130,42 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
         global_step = 0
         micro_step = 0
 
-    # ---- Dataset ----
+    # ---- Dataset with train/val split ----
     from .dataset import DehazeDataset
+
+    all_metadata = [json.loads(l) for l in open(config["train_metadata"])]
+    val_split = config.get("val_split", 0.05)
+    val_items = []
+    train_items = []
+    threshold = int(val_split * 100)
+    for item in all_metadata:
+        if hash(item["image"]) % 100 < threshold:
+            val_items.append(item)
+        else:
+            train_items.append(item)
+
+    if len(train_items) == 0:
+        raise ValueError(
+            f"No training samples after {val_split=} split "
+            f"({len(all_metadata)} total)"
+        )
+    if len(val_items) == 0:
+        print(
+            f"\033[1;33mWARNING: Validation set is empty "
+            f"({val_split=}, {len(all_metadata)} total). "
+            "Skipping validation.\033[0m"
+        )
+
+    print(
+        f"Data split: {len(train_items)} train, "
+        f"{len(val_items)} val ({val_split:.0%})"
+    )
 
     train_dataset = DehazeDataset(
         metadata_path=config["train_metadata"],
         caption_dropout_rate=config.get("caption_dropout_rate", 0.1),
         dropout_seed=seed,
+        metadata_items=train_items,
     )
     if len(train_dataset) == 0:
         raise ValueError(
@@ -202,6 +247,84 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
         name=exp_name,
         config=config,
     )
+
+    def _validate_and_save():
+        nonlocal global_step, micro_step
+
+        # Run validation (before saving checkpoint)
+        if len(val_items) > 0:
+            rng_state_before = get_rng_state()
+
+            val_subset = _select_val_subset(
+                val_items,
+                k=config.get("val_subset_size", 4),
+                seed=seed + global_step,
+            )
+
+            # Models to eval mode for validation
+            transformer.eval()
+            if isinstance(text_encoder, PeftModel):
+                text_encoder.eval()
+
+            val_results = run_validation_batch(
+                vae=vae,
+                transformer=transformer,
+                scheduler=scheduler,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                val_subset=val_subset,
+                guidance_scale=config.get("val_guidance_scale", config.get("guidance_scale", 3.5)),
+                num_inference_steps=config.get("val_num_inference_steps", config.get("num_inference_steps", 28)),
+                max_seq_len=max_seq_len,
+                transformer_device=transformer_device,
+                qwen_device=qwen_device,
+                seed=seed + global_step,
+            )
+
+            # Restore train mode
+            transformer.train()
+            if isinstance(text_encoder, PeftModel):
+                text_encoder.train()
+            # VAE stays eval (never trained, BatchNorm in eval)
+
+            # Restore RNG (validation consumed RNG state)
+            set_rng_state(rng_state_before)
+
+            # Log validation results to wandb
+            if val_results["images"]:
+                wandb_images = []
+                for j, img_dict in enumerate(val_results["images"]):
+                    comparison = torch.cat([
+                        img_dict["hazy"],
+                        img_dict["gt"],
+                        img_dict["cond"],
+                        img_dict["reconstruction"],
+                        img_dict["cfg"],
+                    ], dim=2)  # horizontal concatenation
+                    wandb_images.append(
+                        wandb.Image(comparison, caption=f"val_{j}")
+                    )
+                wandb.log({
+                    "val/images": wandb_images,
+                    "val/psnr": sum(val_results["psnr"]) / len(val_results["psnr"]),
+                    "val/ssim": sum(val_results["ssim"]) / len(val_results["ssim"]),
+                    "val/step": global_step,
+                }, step=global_step)
+                print(
+                    f"Validation (step {global_step}) - "
+                    f"PSNR: {sum(val_results['psnr'])/len(val_results['psnr']):.2f} dB | "
+                    f"SSIM: {sum(val_results['ssim'])/len(val_results['ssim']):.4f}"
+                )
+
+        # Save checkpoint
+        rng_state = get_rng_state()
+        save_checkpoint(
+            transformer, text_encoder, global_step, output_dir,
+            global_step=global_step, micro_step=micro_step,
+            rng_state=rng_state,
+            transformer_opt=transformer_opt, qwen_opt=qwen_opt,
+            config=config,
+        )
 
     print(
         f"Training: {max_steps} steps, batch={config['batch_size']}, "
@@ -332,27 +455,13 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
                     wandb.log(log_dict, step=global_step)
 
             if global_step > 0 and global_step % save_every == 0:
-                rng_state = get_rng_state()
-                save_checkpoint(
-                    transformer, text_encoder, global_step, output_dir,
-                    global_step=global_step, micro_step=micro_step,
-                    rng_state=rng_state,
-                    transformer_opt=transformer_opt, qwen_opt=qwen_opt,
-                    config=config,
-                )
+                _validate_and_save()
 
             if global_step >= max_steps:
                 break
 
     if global_step % save_every != 0:
-        rng_state = get_rng_state()
-        save_checkpoint(
-            transformer, text_encoder, global_step, output_dir,
-            global_step=global_step, micro_step=micro_step,
-            rng_state=rng_state,
-            transformer_opt=transformer_opt, qwen_opt=qwen_opt,
-            config=config,
-        )
+        _validate_and_save()
 
     wandb.finish()
     print("Training complete.")

@@ -28,8 +28,12 @@ class DehazeDataset(Dataset):
         caption_dropout_rate: float = 0.1,
         target_size: int = 512,
         dropout_seed: int = 0,
+        metadata_items: list | None = None,
     ):
-        self.metadata = [json.loads(l) for l in open(metadata_path)]
+        if metadata_items is not None:
+            self.metadata = metadata_items
+        else:
+            self.metadata = [json.loads(l) for l in open(metadata_path)]
         self.caption_dropout_rate = caption_dropout_rate
         self.target_size = target_size
         self.dropout_seed = dropout_seed

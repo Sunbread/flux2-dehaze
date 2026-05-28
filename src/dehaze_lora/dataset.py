@@ -27,10 +27,12 @@ class DehazeDataset(Dataset):
         metadata_path: str,
         caption_dropout_rate: float = 0.1,
         target_size: int = 512,
+        dropout_seed: int = 0,
     ):
         self.metadata = [json.loads(l) for l in open(metadata_path)]
         self.caption_dropout_rate = caption_dropout_rate
         self.target_size = target_size
+        self.dropout_seed = dropout_seed
         self.transform = transforms.Compose([transforms.ToTensor()])
 
     def __len__(self):
@@ -54,7 +56,7 @@ class DehazeDataset(Dataset):
         gt_tensor = self.transform(gt)
 
         caption = DEHAZE_PROMPT
-        if random.random() < self.caption_dropout_rate:
+        if random.Random(self.dropout_seed + idx).random() < self.caption_dropout_rate:
             caption = ""
 
         return {"hazy": hazy_tensor, "gt": gt_tensor, "caption": caption}

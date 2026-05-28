@@ -1,5 +1,6 @@
 import contextlib
 import random
+from typing import Optional
 
 import numpy as np
 import torch
@@ -14,23 +15,37 @@ from .model import (
 )
 from .loss import flow_matching_loss
 from .optimizer import create_optimizer
+from .checkpoint import (
+    get_rng_state, set_rng_state, save_checkpoint, load_training_state,
+)
 from peft import PeftModel
 
 
 
-def save_checkpoint(transformer, text_encoder, step, output_dir):
-    ckpt_dir = Path(output_dir) / f"checkpoint-{step}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+def _training_batches(train_loader, skip=0):
+    """Yield batches from DataLoader, skipping `skip` batches first.
 
-    transformer.save_pretrained(ckpt_dir / "transformer_lora")
+    Handles epoch boundaries via StopIteration, creating a new iterator
+    (and therefore a new shuffle permutation) each epoch. After skip,
+    the generator state and per-worker RNG state are identical to what
+    they would have been after skip batches in a fresh training run.
+    """
+    it = iter(train_loader)
+    for _ in range(skip):
+        try:
+            next(it)
+        except StopIteration:
+            it = iter(train_loader)
+            next(it)
+    while True:
+        try:
+            yield next(it)
+        except StopIteration:
+            it = iter(train_loader)
+            yield next(it)
 
-    if isinstance(text_encoder, PeftModel):
-        text_encoder.save_pretrained(ckpt_dir / "qwen_lora")
 
-    print(f"Checkpoint saved: {ckpt_dir}")
-
-
-def train(config: dict, output_dir: str = "outputs/checkpoints"):
+def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Optional[str] = None):
     transformer_device = config.get("transformer_device", "cuda:0")
     qwen_device = config.get("qwen_device", "cuda:1")
 
@@ -74,12 +89,38 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
     transformer_config = transformer.config
     patch_size = getattr(transformer_config, "patch_size", 1)
 
+    # ---- Resume ----
+    if resume_from is not None:
+        ckpt_dir = Path(resume_from)
+        state = load_training_state(ckpt_dir)
+        # Restore RNG states (must happen after seed setup, before DataLoader)
+        set_rng_state(state["rng_states"])
+        global_step = state["global_step"]
+        micro_step = state["micro_step"]
+        print(f"Resuming from {ckpt_dir} at global_step={global_step}, micro_step={micro_step}")
+
+        # Reload LoRA weights
+        base_transformer = transformer.get_base_model() if isinstance(transformer, PeftModel) else transformer
+        base_qwen = text_encoder.get_base_model() if isinstance(text_encoder, PeftModel) else text_encoder
+        if (ckpt_dir / "transformer_lora").exists():
+            transformer = PeftModel.from_pretrained(base_transformer, str(ckpt_dir / "transformer_lora"))
+        if (ckpt_dir / "qwen_lora").exists():
+            text_encoder = PeftModel.from_pretrained(base_qwen, str(ckpt_dir / "qwen_lora"))
+
+        if global_step >= config["max_steps"]:
+            print(f"Resumed at step {global_step} >= max_steps={config['max_steps']}. Training already complete.")
+            return
+    else:
+        global_step = 0
+        micro_step = 0
+
     # ---- Dataset ----
     from .dataset import DehazeDataset
 
     train_dataset = DehazeDataset(
         metadata_path=config["train_metadata"],
         caption_dropout_rate=config.get("caption_dropout_rate", 0.1),
+        dropout_seed=seed,
     )
     if len(train_dataset) == 0:
         raise ValueError(
@@ -127,9 +168,15 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
         text_encoder, lr=qwen_lr, weight_decay=wd, momentum=momentum
     ) if q_has_lora else None
 
+    # Load optimizer states if resuming
+    if resume_from is not None:
+        opt_states = state["optimizer_states"]
+        if opt_states["transformer"] is not None and transformer_opt is not None:
+            transformer_opt.load_state_dict(opt_states["transformer"])
+        if opt_states["qwen"] is not None and qwen_opt is not None:
+            qwen_opt.load_state_dict(opt_states["qwen"])
+
     max_seq_len = config.get("max_sequence_length", 512)
-    global_step = 0
-    micro_step = 0
     max_steps = config["max_steps"]
     save_every = config.get("save_every", 250)
     log_freq = config.get("log_freq", 10)
@@ -166,133 +213,146 @@ def train(config: dict, output_dir: str = "outputs/checkpoints"):
     step_total = 0
     step_loss = 0.0
 
-    with tqdm(total=max_steps, desc="Training", unit="step", dynamic_ncols=True) as pbar:
-        while global_step < max_steps:
-            for batch in train_loader:
-                with torch.no_grad():
-                    hazy = batch["hazy"].to(transformer_device, dtype=torch.bfloat16)
-                    gt = batch["gt"].to(transformer_device, dtype=torch.bfloat16)
+    with tqdm(
+        total=max_steps, initial=global_step,
+        desc="Training", unit="step", dynamic_ncols=True,
+    ) as pbar:
+        for batch in _training_batches(train_loader, skip=micro_step):
+            with torch.no_grad():
+                hazy = batch["hazy"].to(transformer_device, dtype=torch.bfloat16)
+                gt = batch["gt"].to(transformer_device, dtype=torch.bfloat16)
 
-                    hazy_latent = encode_vae_image(vae, hazy)
-                    gt_latent = encode_vae_image(vae, gt)
+                hazy_latent = encode_vae_image(vae, hazy)
+                gt_latent = encode_vae_image(vae, gt)
 
-                # Encode text (caption dropout already handled by dataset)
-                captions = batch["caption"]
-                is_uncond = [c == "" for c in captions]
-                step_uncond += sum(is_uncond)
-                step_total += len(is_uncond)
+            # Encode text (caption dropout already handled by dataset)
+            captions = batch["caption"]
+            is_uncond = [c == "" for c in captions]
+            step_uncond += sum(is_uncond)
+            step_total += len(is_uncond)
 
-                ctx = torch.no_grad() if not q_has_lora else contextlib.nullcontext()
-                with ctx:
-                    prompt_embeds, text_ids = encode_prompts(
-                        text_encoder, tokenizer, captions,
-                        max_seq_len, qwen_device, torch.bfloat16,
+            ctx = torch.no_grad() if not q_has_lora else contextlib.nullcontext()
+            with ctx:
+                prompt_embeds, text_ids = encode_prompts(
+                    text_encoder, tokenizer, captions,
+                    max_seq_len, qwen_device, torch.bfloat16,
+                )
+            prompt_embeds = prompt_embeds.to(transformer_device)
+            text_ids = text_ids.to(transformer_device)
+
+            # Timestep and noise
+            bsz = gt_latent.shape[0]
+            rng = torch.Generator(transformer_device).manual_seed(seed + micro_step)
+            t = torch.randint(
+                0, scheduler.config.num_train_timesteps, (bsz,),
+                generator=rng, device=transformer_device,
+            ).long()
+            sigmas = t.float() / scheduler.config.num_train_timesteps
+
+            noise = torch.randn(
+                gt_latent.shape, generator=rng,
+                device=transformer_device, dtype=torch.bfloat16,
+            )
+            noisy_latent = (
+                (1.0 - sigmas.view(bsz, 1, 1, 1)) * gt_latent
+                + sigmas.view(bsz, 1, 1, 1) * noise
+            )
+
+            # Patchify
+            noisy_tokens, noisy_ids = patchify_and_make_ids(
+                noisy_latent, patch_size=patch_size, index=0.0,
+            )
+            ref_tokens, ref_ids = patchify_and_make_ids(
+                hazy_latent, patch_size=patch_size, index=10.0,
+            )
+            hidden_states = torch.cat([noisy_tokens, ref_tokens], dim=1)
+            img_ids = torch.cat([noisy_ids, ref_ids], dim=1)
+
+            # Forward + backward with manual gradient accumulation (force Flash SDPA)
+            with (
+                sdpa_kernel(SDPBackend.FLASH_ATTENTION),
+                torch.amp.autocast("cuda", dtype=torch.bfloat16),
+            ):
+                model_pred = transformer(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=sigmas.to(dtype=torch.bfloat16),
+                    img_ids=img_ids,
+                    txt_ids=text_ids,
+                    return_dict=False,
+                )[0]
+
+                v_theta = model_pred[:, : noisy_tokens.shape[1], :]
+                v_theta = unpatchify(
+                    v_theta,
+                    gt_latent.shape[2], gt_latent.shape[3],
+                    patch_size=patch_size,
+                )
+
+                loss = flow_matching_loss(v_theta, gt_latent, noise)
+                loss_scaled = loss / grad_accum  # normalize for accumulation
+
+            loss_scaled.backward()
+            step_loss += loss.detach()
+            micro_step += 1
+
+            if micro_step % grad_accum == 0:
+                if transformer_opt is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        transformer.parameters(), transformer_grad_clip
                     )
-                prompt_embeds = prompt_embeds.to(transformer_device)
-                text_ids = text_ids.to(transformer_device)
+                    transformer_opt.step()
+                    transformer_opt.zero_grad()
 
-                # Timestep and noise
-                bsz = gt_latent.shape[0]
-                rng = torch.Generator(transformer_device).manual_seed(seed + micro_step)
-                t = torch.randint(
-                    0, scheduler.config.num_train_timesteps, (bsz,),
-                    generator=rng, device=transformer_device,
-                ).long()
-                sigmas = t.float() / scheduler.config.num_train_timesteps
-
-                noise = torch.randn(
-                    gt_latent.shape, generator=rng,
-                    device=transformer_device, dtype=torch.bfloat16,
-                )
-                noisy_latent = (
-                    (1.0 - sigmas.view(bsz, 1, 1, 1)) * gt_latent
-                    + sigmas.view(bsz, 1, 1, 1) * noise
-                )
-
-                # Patchify
-                noisy_tokens, noisy_ids = patchify_and_make_ids(
-                    noisy_latent, patch_size=patch_size, index=0.0,
-                )
-                ref_tokens, ref_ids = patchify_and_make_ids(
-                    hazy_latent, patch_size=patch_size, index=10.0,
-                )
-                hidden_states = torch.cat([noisy_tokens, ref_tokens], dim=1)
-                img_ids = torch.cat([noisy_ids, ref_ids], dim=1)
-
-                # Forward + backward with manual gradient accumulation (force Flash SDPA)
-                with (
-                    sdpa_kernel(SDPBackend.FLASH_ATTENTION),
-                    torch.amp.autocast("cuda", dtype=torch.bfloat16),
-                ):
-                    model_pred = transformer(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=sigmas.to(dtype=torch.bfloat16),
-                        img_ids=img_ids,
-                        txt_ids=text_ids,
-                        return_dict=False,
-                    )[0]
-
-                    v_theta = model_pred[:, : noisy_tokens.shape[1], :]
-                    v_theta = unpatchify(
-                        v_theta,
-                        gt_latent.shape[2], gt_latent.shape[3],
-                        patch_size=patch_size,
+                if qwen_opt is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        text_encoder.parameters(), qwen_grad_clip
                     )
+                    qwen_opt.step()
+                    qwen_opt.zero_grad()
 
-                    loss = flow_matching_loss(v_theta, gt_latent, noise)
-                    loss_scaled = loss / grad_accum  # normalize for accumulation
+                global_step += 1
+                avg_loss = (step_loss / grad_accum).item()
+                pbar.update(1)
+                pbar.set_postfix(loss=f"{avg_loss:.4f}")
 
-                loss_scaled.backward()
-                step_loss += loss.detach()
-                micro_step += 1
-
-                if micro_step % grad_accum == 0:
-                    if transformer_opt is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            transformer.parameters(), transformer_grad_clip
-                        )
-                        transformer_opt.step()
-                        transformer_opt.zero_grad()
-
+                if global_step % log_freq == 0:
+                    cond_ratio = 1.0 - step_uncond / max(step_total, 1)
+                    log_dict = {
+                        "train/loss": avg_loss,
+                        "train/cond_ratio": cond_ratio,
+                        "train/transformer_lr": transformer_lr,
+                        "train/step": global_step,
+                    }
+                    step_uncond = 0
+                    step_total = 0
+                    step_loss = 0.0
                     if qwen_opt is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            text_encoder.parameters(), qwen_grad_clip
-                        )
-                        qwen_opt.step()
-                        qwen_opt.zero_grad()
+                        log_dict["train/qwen_lr"] = qwen_lr
+                    wandb.log(log_dict, step=global_step)
 
-                    global_step += 1
-                    avg_loss = (step_loss / grad_accum).item()
-                    pbar.update(1)
-                    pbar.set_postfix(loss=f"{avg_loss:.4f}")
+            if global_step > 0 and global_step % save_every == 0:
+                rng_state = get_rng_state()
+                save_checkpoint(
+                    transformer, text_encoder, global_step, output_dir,
+                    global_step=global_step, micro_step=micro_step,
+                    rng_state=rng_state,
+                    transformer_opt=transformer_opt, qwen_opt=qwen_opt,
+                    config=config,
+                )
 
-                    if global_step % log_freq == 0:
-                        cond_ratio = 1.0 - step_uncond / max(step_total, 1)
-                        log_dict = {
-                            "train/loss": avg_loss,
-                            "train/cond_ratio": cond_ratio,
-                            "train/transformer_lr": transformer_lr,
-                            "train/step": global_step,
-                        }
-                        step_uncond = 0
-                        step_total = 0
-                        step_loss = 0.0
-                        if qwen_opt is not None:
-                            log_dict["train/qwen_lr"] = qwen_lr
-                        wandb.log(log_dict, step=global_step)
-
-                if global_step > 0 and global_step % save_every == 0:
-                    save_checkpoint(
-                        transformer, text_encoder,
-                        global_step, output_dir,
-                    )
-
-                if global_step >= max_steps:
-                    break
+            if global_step >= max_steps:
+                break
 
     if global_step % save_every != 0:
-        save_checkpoint(transformer, text_encoder, global_step, output_dir)
+        rng_state = get_rng_state()
+        save_checkpoint(
+            transformer, text_encoder, global_step, output_dir,
+            global_step=global_step, micro_step=micro_step,
+            rng_state=rng_state,
+            transformer_opt=transformer_opt, qwen_opt=qwen_opt,
+            config=config,
+        )
 
     wandb.finish()
     print("Training complete.")
@@ -304,7 +364,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume training from a checkpoint directory")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    train(config, output_dir=config.get("output_dir", "outputs/checkpoints"))
+    train(
+        config,
+        output_dir=config.get("output_dir", "outputs/checkpoints"),
+        resume_from=args.resume,
+    )

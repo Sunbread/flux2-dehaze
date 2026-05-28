@@ -7,4 +7,4 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
-uv run python -m src.dehaze_lora.train --config configs/config.yaml
+uv run python -m src.dehaze_lora.train --config configs/config.yaml "$@"

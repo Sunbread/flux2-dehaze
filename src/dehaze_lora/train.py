@@ -254,6 +254,7 @@ def train(
     momentum = float(config.get("momentum", 0.95))
     transformer_grad_clip = float(config.get("transformer_grad_clip", 1.0))
     qwen_grad_clip = float(config.get("qwen_grad_clip", 1.0))
+    warmup_steps = int(config.get("warmup_steps", 0))
 
     t_has_lora = lora_target in ("transformer", "both")
     q_has_lora = lora_target in ("qwen", "both")
@@ -480,6 +481,13 @@ def train(
             micro_step += 1
 
             if micro_step % grad_accum == 0:
+                if warmup_steps > 0:
+                    warmup_factor = min(1.0, (global_step + 1) / warmup_steps)
+                    if transformer_opt is not None:
+                        transformer_opt.param_groups[0]['lr'] = transformer_lr * warmup_factor
+                    if qwen_opt is not None:
+                        qwen_opt.param_groups[0]['lr'] = qwen_lr * warmup_factor
+
                 if transformer_opt is not None:
                     torch.nn.utils.clip_grad_norm_(
                         transformer.parameters(), transformer_grad_clip
@@ -504,11 +512,11 @@ def train(
                     log_dict = {
                         "train/loss": avg_loss,
                         "train/cond_ratio": cond_ratio,
-                        "train/transformer_lr": transformer_lr,
+                        "train/transformer_lr": transformer_opt.param_groups[0]['lr'] if transformer_opt is not None else 0.0,
                         "train/step": global_step,
                     }
                     if qwen_opt is not None:
-                        log_dict["train/qwen_lr"] = qwen_lr
+                        log_dict["train/qwen_lr"] = qwen_opt.param_groups[0]['lr']
                     wandb.log(log_dict, step=global_step)
 
                 step_uncond = 0

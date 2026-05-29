@@ -13,6 +13,7 @@ transformer_lr: 1e-3           # Muon learning rate for transformer LoRA
 qwen_lr: 1e-4                  # Muon learning rate for Qwen3 LoRA
 weight_decay: 0.01
 momentum: 0.95
+warmup_steps: 50               # linear LR warmup from 0 → base_lr
 transformer_grad_clip: 1.0     # max grad norm for transformer LoRA
 qwen_grad_clip: 1.0            # max grad norm for Qwen3 LoRA
 caption_dropout_rate: 0.1     # 10% empty prompt; target remains GT clear image for CFG

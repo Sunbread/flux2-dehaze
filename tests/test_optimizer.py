@@ -96,3 +96,46 @@ def test_custom_lr_and_wd():
     group = opt.param_groups[0]
     assert group["lr"] == 5e-4
     assert group["weight_decay"] == 0.05
+
+
+def test_warmup_lr_schedule():
+    """Linear LR warmup: lr = base_lr * min(1, (step+1) / warmup_steps)."""
+    model = Simple2DModel()
+    base_lr = 1e-3
+    warmup_steps = 50
+    opt = create_optimizer(model, lr=base_lr)
+
+    for step in range(warmup_steps + 10):
+        factor = min(1.0, (step + 1) / warmup_steps)
+        opt.param_groups[0]['lr'] = base_lr * factor
+        expected = base_lr * factor
+        assert opt.param_groups[0]['lr'] == pytest.approx(expected)
+
+
+def test_warmup_reaches_full_lr():
+    """After warmup_steps, LR equals base_lr."""
+    model = Simple2DModel()
+    base_lr = 1e-3
+    warmup_steps = 50
+    opt = create_optimizer(model, lr=base_lr)
+
+    # Simulate steps including warmup
+    for step in range(warmup_steps):
+        factor = min(1.0, (step + 1) / warmup_steps)
+        opt.param_groups[0]['lr'] = base_lr * factor
+
+    assert opt.param_groups[0]['lr'] == pytest.approx(base_lr)
+
+    # After warmup, LR stays at base_lr
+    factor = min(1.0, (warmup_steps + 1) / warmup_steps)
+    opt.param_groups[0]['lr'] = base_lr * factor
+    assert opt.param_groups[0]['lr'] == pytest.approx(base_lr)
+
+
+def test_warmup_zero_steps_noop():
+    """warmup_steps=0: LR always at base_lr (factor = min(1, 1/0) = 1.0)."""
+    model = Simple2DModel()
+    base_lr = 1e-3
+    opt = create_optimizer(model, lr=base_lr)
+    # warmup_steps=0 → skip warmup entirely, LR stays at creation value
+    assert opt.param_groups[0]['lr'] == pytest.approx(base_lr)

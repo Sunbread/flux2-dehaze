@@ -156,7 +156,7 @@ if lora_target not in ("transformer", "qwen", "both"):
 ### 6. Config Wiring -- Every Key Must Have a Consumer
 Past bugs: `target_size` accepted by dataset constructor but never passed from config; `guidance_scale`/`num_inference_steps` in config.yaml not read by validate(). Every config key must be read somewhere. If you add a new config key, verify end-to-end that it reaches its consumer.
 
-Also: code defaults for config values can silently diverge from config.yaml. Example: `qwen_lr` config value is `1e-4` but `train.py:216` has `config.get("qwen_lr", 1e-3)` — if the key is accidentally deleted from config, the fallback is 10x higher. Keep code defaults in sync with config.yaml.
+Also: code defaults for config values can silently diverge from config.yaml. Example: `qwen_lr` config value is `1e-4` but `train.py:252` has `config.get("qwen_lr", 1e-3)` — if the key is accidentally deleted from config, the fallback is 10x higher. Keep code defaults in sync with config.yaml.
 
 ### 7. VAE `eval()` in Validation AND Training
 `load_inference_models` in `validate.py` must call `vae.eval()` AND `transformer.eval()` — both have BatchNorm layers whose running stats drift in training mode even under `no_grad()`, corrupting decode quality across multi-image validation runs. `vae.eval()` is also set in `train.py:117` after model loading.
@@ -199,7 +199,6 @@ tests/
   test_metrics.py          # CPU: PSNR/SSIM calculations
   test_utils.py            # CPU: config loading utilities
   test_validation.py       # CPU: validation split logic, subset selection, RNG isolation
-  test_type_boundaries.py  # CPU: type coercion correctness at module boundaries
 ```
 
 ### Test Categories

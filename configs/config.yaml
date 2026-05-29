@@ -8,15 +8,15 @@ lora_alpha: 8
 seed: 42
 batch_size: 4                 # per-device batch (2x40GB: 4; 1x80GB: 2)
 gradient_accumulation_steps: 8  # effective batch = 4 x 8 = 32
-max_steps: 1000                # optimizer steps
+max_steps: 500                # optimizer steps
 transformer_lr: 1e-3           # Muon learning rate for transformer LoRA
 qwen_lr: 1e-4                  # Muon learning rate for Qwen3 LoRA
 weight_decay: 0.01
 momentum: 0.95
-warmup_steps: 50               # linear LR warmup from 0 → base_lr
+warmup_steps: 25               # linear LR warmup from 0 → base_lr
 transformer_grad_clip: 1.0     # max grad norm for transformer LoRA
 qwen_grad_clip: 1.0            # max grad norm for Qwen3 LoRA
-caption_dropout_rate: 0.1     # 10% empty prompt; target remains GT clear image for CFG
+caption_dropout_rate: 0        # no empty prompt; target remains GT clear image for CFG
 max_sequence_length: 512
 transformer_device: "cuda:0"   # GPU for transformer + VAE
 qwen_device: "cuda:1"          # GPU for Qwen3 text encoder
@@ -37,8 +37,8 @@ val_metadata: "data/processed/NH-HAZE/metadata.jsonl"
 
 # ===== Checkpointing =====
 output_dir: "outputs/checkpoints"
-save_every: 100
-log_freq: 5
+save_every: 50
+log_freq: 1
 
 # ===== wandb =====
 wandb_project: "dehaze-flux2-klein"

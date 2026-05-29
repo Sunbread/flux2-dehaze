@@ -32,6 +32,12 @@ def resize_and_save(
     img_pil.save(dst_path)
 
 
+def _resize_task(args: tuple[Path, Path, int]) -> None:
+    """Worker: resize and save a single image. Path-agnostic — works for GTs and hazies."""
+    src, dst, target_size = args
+    resize_and_save(src, dst, target_size)
+
+
 def _process_pair(
     args: tuple[Path, Path, Path, Path, int, str],
 ) -> MetadataItem:
@@ -99,17 +105,21 @@ def preprocess_reside_standard(
     split: str = "train",
     workers: Optional[int] = None,
 ) -> None:
-    """Preprocess RESIDE-Standard format using multiprocessing."""
+    """Preprocess RESIDE-Standard format.
+
+    Deduplicates GTs: each unique clear image is saved once. All hazy images
+    sharing a GT reference the same saved GT file, so downstream hash-splits
+    (e.g. md5(gt_path) % 100) keep same-scene pairs together.
+    """
     csv_path = input_dir / "metadata.csv"
 
     output_hazy = output_dir / "hazy"
-    output_clear = output_dir / "clear"
+    output_gt = output_dir / "GT"
     output_hazy.mkdir(parents=True, exist_ok=True)
-    output_clear.mkdir(parents=True, exist_ok=True)
+    output_gt.mkdir(parents=True, exist_ok=True)
 
-    # Gather all tasks first
-    tasks = []
-    pair_idx = 0
+    # Gather: group hazy paths by their GT source
+    gt_map: dict[str, list[str]] = {}  # clear_rel -> [hazy_rel, ...]
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             clear_rel = row["clear_image_path"].strip()
@@ -120,35 +130,63 @@ def preprocess_reside_standard(
                 continue
 
             hazy_list = _parse_path_list(hazy_str)
+            valid_hazies = []
             for hazy_rel in hazy_list:
                 hazy_src = input_dir / hazy_rel.strip()
-                if not hazy_src.exists():
-                    continue
-                new_name = f"{split}_{pair_idx:05d}.png"
-                tasks.append((
-                    hazy_src, clear_src,
-                    output_hazy / new_name, output_clear / new_name,
-                    512, new_name,
-                ))
-                pair_idx += 1
+                if hazy_src.exists():
+                    valid_hazies.append(hazy_rel.strip())
+            if valid_hazies:
+                gt_map[clear_rel] = valid_hazies
+
+    if not gt_map:
+        print("No valid pairs found.")
+        return
+
+    gt_keys = list(gt_map.keys())
+
+    # Phase 1: save every unique GT once
+    gt_dst_of: dict[str, Path] = {}
+    gt_tasks: list[tuple[Path, Path, int]] = []
+    for idx, clear_rel in enumerate(gt_keys):
+        dst = output_gt / f"gt_{idx:05d}.png"
+        gt_dst_of[clear_rel] = dst
+        gt_tasks.append((input_dir / clear_rel, dst, 512))
 
     if workers is None:
-        workers = min(os.cpu_count() or 1, len(tasks))
+        workers = min(os.cpu_count() // 2 or 1, len(gt_keys))
 
-    print(f"Processing {len(tasks)} pairs with {workers} workers...")
-    metadata = []
+    print(f"Processing {len(gt_keys)} unique GTs with {workers} workers...")
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for i, result in enumerate(pool.map(_process_pair, tasks)):
-            metadata.append(result)
-            if (i + 1) % 1000 == 0:
-                print(f"  {i + 1}/{len(tasks)} pairs done")
+        for _ in pool.map(_resize_task, gt_tasks):
+            pass
 
+    # Phase 2: save every hazy image
+    hazy_tasks: list[tuple[Path, Path, int]] = []
+    hazy_meta: list[tuple[Path, Path]] = []  # (hazy_dst, gt_dst)
+    for idx, clear_rel in enumerate(gt_keys):
+        gt_dst = gt_dst_of[clear_rel]
+        for h_idx, hazy_rel in enumerate(gt_map[clear_rel]):
+            hazy_dst = output_hazy / f"{split}_{idx:05d}_{h_idx:03d}.png"
+            hazy_tasks.append((input_dir / hazy_rel, hazy_dst, 512))
+            hazy_meta.append((hazy_dst, gt_dst))
+
+    print(f"Processing {len(hazy_tasks)} hazy images with {workers} workers...")
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for _ in pool.map(_resize_task, hazy_tasks):
+            pass
+
+    # Write metadata
     meta_path = output_dir / f"metadata_{split}.jsonl"
     with open(meta_path, "w") as f:
-        for item in metadata:
-            f.write(json.dumps(item) + "\n")
+        for hazy_dst, gt_dst in hazy_meta:
+            f.write(json.dumps({
+                "image": str(hazy_dst),
+                "gt": str(gt_dst),
+                "caption": DEHAZE_PROMPT,
+            }) + "\n")
 
-    print(f"Preprocessed {len(metadata)} pairs (RESIDE-Standard) -> {meta_path}")
+    total_pairs = sum(len(v) for v in gt_map.values())
+    print(f"Preprocessed {total_pairs} hazy images, {len(gt_keys)} unique GTs -> {meta_path}")
 
 
 def _parse_path_list(raw: str) -> list[str]:

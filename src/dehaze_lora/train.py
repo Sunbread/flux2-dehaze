@@ -35,7 +35,7 @@ def _split_train_val_metadata(
     train_items: list[MetadataItem] = []
     val_items: list[MetadataItem] = []
     for item in metadata:
-        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
+        bucket = int(hashlib.md5(item["gt"].encode()).hexdigest(), 16) % 100
         if bucket < threshold:
             val_items.append(item)
         else:

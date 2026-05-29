@@ -507,12 +507,13 @@ def train(
                         "train/transformer_lr": transformer_lr,
                         "train/step": global_step,
                     }
-                    step_uncond = 0
-                    step_total = 0
-                    step_loss = 0.0
                     if qwen_opt is not None:
                         log_dict["train/qwen_lr"] = qwen_lr
                     wandb.log(log_dict, step=global_step)
+
+                step_uncond = 0
+                step_total = 0
+                step_loss = 0.0
 
             if global_step > 0 and global_step % save_every == 0:
                 _validate_and_save()

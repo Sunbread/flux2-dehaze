@@ -523,11 +523,11 @@ def train(
                 step_total = 0
                 step_loss = 0.0
 
-            if global_step > 0 and global_step % save_every == 0:
-                _validate_and_save()
+                if global_step > 0 and global_step % save_every == 0:
+                    _validate_and_save()
 
-            if global_step >= max_steps:
-                break
+                if global_step >= max_steps:
+                    break
 
     if global_step % save_every != 0:
         _validate_and_save()

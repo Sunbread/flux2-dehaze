@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from diffusers import (
@@ -6,7 +10,9 @@ from diffusers import (
     Flux2Transformer2DModel,
 )
 from transformers import Qwen3ForCausalLM, Qwen2TokenizerFast
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
+
+from .types import ModelDict
 
 QWEN_LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 TRANSFORMER_LORA_MODULES = ["to_q", "to_k", "to_v", "to_out.0", "to_qkv_mlp_proj"]
@@ -15,7 +21,12 @@ TRANSFORMER_LORA_MODULES = ["to_q", "to_k", "to_v", "to_out.0", "to_qkv_mlp_proj
 QWEN3_HIDDEN_STATES_LAYERS = (9, 18, 27)
 
 
-def _inject_lora(model, rank: int, alpha: int, target_modules: list):
+def _inject_lora(
+    model: torch.nn.Module,
+    rank: int,
+    alpha: int,
+    target_modules: list[str],
+) -> PeftModel:
     lora_config = LoraConfig(
         r=rank,
         lora_alpha=alpha,
@@ -34,7 +45,7 @@ def load_models(
     transformer_device: str = "cuda:0",
     qwen_device: str = "cuda:1",
     gradient_checkpointing: bool = False,
-):
+) -> ModelDict:
     # VAE (always on transformer device, always frozen)
     vae = AutoencoderKLFlux2.from_pretrained(
         model_name, subfolder="vae", torch_dtype=torch.bfloat16
@@ -109,12 +120,14 @@ def _prepare_text_ids(x: torch.Tensor) -> torch.Tensor:
     torch.arange(1) produces int64 [0], keeping the cartesian product
     in int64 (text_ids convention in Flux2)."""
     B, L, _ = x.shape
-    out_ids = []
+    B = int(B)
+    seq_len = int(L)
+    out_ids: list[torch.Tensor] = []
     for i in range(B):
         t = torch.arange(1, device=x.device)
         h = torch.arange(1, device=x.device)
         w = torch.arange(1, device=x.device)
-        l = torch.arange(L, device=x.device)
+        l = torch.arange(seq_len, device=x.device)
         coords = torch.cartesian_prod(t, h, w, l)
         out_ids.append(coords)
     return torch.stack(out_ids)
@@ -138,7 +151,12 @@ def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
     return latents
 
 
-def patchify_and_make_ids(latent, patch_size=1, index=0.0, axes_dim=4):
+def patchify_and_make_ids(
+    latent: torch.Tensor,
+    patch_size: int = 1,
+    index: float = 0.0,
+    axes_dim: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Transformer-level patchify: BCHW → B(HW)C, plus RoPE position coordinates.
 
@@ -149,6 +167,10 @@ def patchify_and_make_ids(latent, patch_size=1, index=0.0, axes_dim=4):
     Flux2: patch_size=1, axes_dim=4.
     """
     import torch.nn.functional as F
+
+    patch_size = int(patch_size)
+    axes_dim = int(axes_dim)
+    index = float(index)
 
     bs, c, h, w = latent.shape
     ph = pw = patch_size
@@ -174,8 +196,17 @@ def patchify_and_make_ids(latent, patch_size=1, index=0.0, axes_dim=4):
     return tokens, ids
 
 
-def unpatchify(tokens, h_orig, w_orig, patch_size=1):
+def unpatchify(
+    tokens: torch.Tensor,
+    h_orig: int,
+    w_orig: int,
+    patch_size: int = 1,
+) -> torch.Tensor:
     """Reverse of patchify_and_make_ids: B(HW)C → BCHW."""
+    h_orig = int(h_orig)
+    w_orig = int(w_orig)
+    patch_size = int(patch_size)
+
     bs, n, c = tokens.shape
     ph = pw = patch_size
 
@@ -232,13 +263,13 @@ def decode_vae_image(vae, latents: torch.Tensor) -> torch.Tensor:
 
 
 def encode_prompts(
-    text_encoder,
-    tokenizer,
+    text_encoder: Any,
+    tokenizer: Any,
     prompts: list[str],
     max_seq_len: int = 512,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Batch-encode prompts → (prompt_embeds, text_ids).
 
@@ -246,6 +277,9 @@ def encode_prompts(
     batched forward pass, and concatenates hidden states from layers
     (9, 18, 27) → joint_attention_dim (12288).
     """
+    max_seq_len = int(max_seq_len)
+    device = str(device)
+
     texts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": p}],

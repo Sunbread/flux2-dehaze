@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import json
 import random
+from typing import Sequence
+
 from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
+
+from .types import DatasetItem, MetadataItem
 
 DEHAZE_PROMPT = (
     "Dehaze this image naturally. Remove fog, mist, smog, and gray atmospheric "
@@ -28,21 +34,21 @@ class DehazeDataset(Dataset):
         caption_dropout_rate: float = 0.1,
         target_size: int = 512,
         dropout_seed: int = 0,
-        metadata_items: list | None = None,
+        metadata_items: Sequence[MetadataItem] | None = None,
     ):
         if metadata_items is not None:
-            self.metadata = metadata_items
+            self.metadata: list[MetadataItem] = list(metadata_items)
         else:
             self.metadata = [json.loads(l) for l in open(metadata_path)]
-        self.caption_dropout_rate = caption_dropout_rate
-        self.target_size = target_size
-        self.dropout_seed = dropout_seed
+        self.caption_dropout_rate = float(caption_dropout_rate)
+        self.target_size = int(target_size)
+        self.dropout_seed = int(dropout_seed)
         self.transform = transforms.Compose([transforms.ToTensor()])
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.metadata)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> DatasetItem:
         item = self.metadata[idx]
 
         hazy = Image.open(item["image"]).convert("RGB")
@@ -70,14 +76,14 @@ class DehazeValDataset(Dataset):
     """Validation set; uses per-sample caption from metadata, falling back to DEHAZE_PROMPT."""
 
     def __init__(self, metadata_path: str, target_size: int = 512):
-        self.metadata = [json.loads(l) for l in open(metadata_path)]
-        self.target_size = target_size
+        self.metadata: list[MetadataItem] = [json.loads(l) for l in open(metadata_path)]
+        self.target_size = int(target_size)
         self.transform = transforms.Compose([transforms.ToTensor()])
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.metadata)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> DatasetItem:
         item = self.metadata[idx]
         hazy = Image.open(item["image"]).convert("RGB")
         gt = Image.open(item["gt"]).convert("RGB")

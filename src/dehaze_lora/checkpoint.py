@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import random
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -7,9 +10,10 @@ from pathlib import Path
 from peft import PeftModel
 
 from .utils import save_config
+from .types import PathInput
 
 
-def get_rng_state() -> dict:
+def get_rng_state() -> dict[str, Any]:
     """Capture all RNG states into a serializable dict.
 
     Returns keys: python_random, numpy, torch_cpu, torch_cuda (list of
@@ -29,7 +33,7 @@ def get_rng_state() -> dict:
     return state
 
 
-def set_rng_state(state: dict) -> None:
+def set_rng_state(state: Mapping[str, Any]) -> None:
     """Restore RNG states from a dict produced by get_rng_state.
 
     CUDA keys are skipped if CUDA is unavailable (CPU-only resume).
@@ -42,16 +46,16 @@ def set_rng_state(state: dict) -> None:
 
 
 def save_checkpoint(
-    transformer,
-    text_encoder,
+    transformer: Any,
+    text_encoder: Any,
     step: int,
-    output_dir,
+    output_dir: PathInput,
     global_step: int,
     micro_step: int,
-    rng_state: dict,
-    transformer_opt,
-    qwen_opt,
-    config: dict,
+    rng_state: Mapping[str, Any],
+    transformer_opt: Any,
+    qwen_opt: Any,
+    config: Mapping[str, Any],
 ) -> Path:
     """Save full training state: LoRA weights, optimizer, counters, RNG, config.
 
@@ -88,7 +92,7 @@ def save_checkpoint(
     return ckpt_dir
 
 
-def load_training_state(checkpoint_dir) -> dict:
+def load_training_state(checkpoint_dir: PathInput) -> dict[str, Any]:
     """Load training_state.pt from a checkpoint directory.
 
     Returns dict with keys: global_step, micro_step, rng_states,

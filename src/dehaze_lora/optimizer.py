@@ -1,7 +1,16 @@
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 
 
-def create_optimizer(model, lr: float = 1e-3, weight_decay: float = 0.01, momentum: float = 0.95):
+def create_optimizer(
+    model: Any,
+    lr: float = 1e-3,
+    weight_decay: float = 0.01,
+    momentum: float = 0.95,
+) -> torch.optim.Muon:
     """Muon optimizer for a single model's LoRA parameters.
 
     Collects all trainable (requires_grad) parameters from the model

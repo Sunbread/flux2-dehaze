@@ -1,16 +1,24 @@
+from __future__ import annotations
+
 import csv
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 from PIL import Image
 from torchvision import transforms
 
 from .dataset import DEHAZE_PROMPT
+from .types import MetadataItem, PathInput
 
 
-def resize_and_save(src, dst_path: Path, target_size: int = 512):
+def resize_and_save(
+    src: PathInput | Image.Image,
+    dst_path: Path,
+    target_size: int = 512,
+) -> None:
     if isinstance(src, Image.Image):
         img = src.convert("RGB")
     else:
@@ -24,7 +32,9 @@ def resize_and_save(src, dst_path: Path, target_size: int = 512):
     img_pil.save(dst_path)
 
 
-def _process_pair(args):
+def _process_pair(
+    args: tuple[Path, Path, Path, Path, int, str],
+) -> MetadataItem:
     """Worker function: process one hazy+clear pair. Takes paths, returns metadata dict."""
     hazy_src, clear_src, hazy_dst, clear_dst, target_size, pair_name = args
     resize_and_save(hazy_src, hazy_dst, target_size)
@@ -36,7 +46,7 @@ def _process_pair(args):
     }
 
 
-def preprocess_reside(input_dir: Path, output_dir: Path, split: str = "train"):
+def preprocess_reside(input_dir: Path, output_dir: Path, split: str = "train") -> None:
     hazy_dir = input_dir / "hazy"
     clear_dir = input_dir / "clear"
     list_file = input_dir / "list" / f"{split}_list.txt"
@@ -83,8 +93,12 @@ def preprocess_reside(input_dir: Path, output_dir: Path, split: str = "train"):
     print(f"Preprocessed {len(metadata)} pairs -> {meta_path}")
 
 
-def preprocess_reside_standard(input_dir: Path, output_dir: Path, split: str = "train",
-                                workers: int = None):
+def preprocess_reside_standard(
+    input_dir: Path,
+    output_dir: Path,
+    split: str = "train",
+    workers: Optional[int] = None,
+) -> None:
     """Preprocess RESIDE-Standard format using multiprocessing."""
     csv_path = input_dir / "metadata.csv"
 
@@ -138,7 +152,7 @@ def preprocess_reside_standard(input_dir: Path, output_dir: Path, split: str = "
 
 
 def _parse_path_list(raw: str) -> list[str]:
-    """Parse a string like \"['hazy/1_1.png', 'hazy/1_2.png']\" into a list of paths."""
+    """Parse a string like "['hazy/1_1.png', 'hazy/1_2.png']" into a list of paths."""
     raw = raw.strip()
     if raw.startswith("[") and raw.endswith("]"):
         inner = raw[1:-1]
@@ -146,7 +160,11 @@ def _parse_path_list(raw: str) -> list[str]:
     return [raw]
 
 
-def preprocess_nhhaze(input_dir: Path, output_dir: Path, workers: int = None):
+def preprocess_nhhaze(
+    input_dir: Path,
+    output_dir: Path,
+    workers: Optional[int] = None,
+) -> None:
     hazy_dir = input_dir / "hazy"
     gt_dir = input_dir / "GT"
 

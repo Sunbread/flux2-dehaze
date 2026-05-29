@@ -128,6 +128,7 @@ class TinyAttention(torch.nn.Module):
         self.to_q = torch.nn.Linear(dim, dim)
         self.to_k = torch.nn.Linear(dim, dim)
         self.to_v = torch.nn.Linear(dim, dim)
+        self.to_qkv_mlp_proj = torch.nn.Linear(dim, dim)
         self.to_out = torch.nn.Sequential(
             torch.nn.Linear(dim, dim),
             torch.nn.Dropout(0.0),
@@ -137,7 +138,8 @@ class TinyAttention(torch.nn.Module):
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
-        out = q * k * v  # dummy op
+        mlp = self.to_qkv_mlp_proj(x)
+        out = q * k * v * mlp  # dummy op
         return self.to_out(out)
 
 

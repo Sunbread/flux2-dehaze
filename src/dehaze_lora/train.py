@@ -1,12 +1,14 @@
+from __future__ import annotations
+
 import contextlib
 import hashlib
 import json
 import random
-from typing import Optional
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Optional
 
 import numpy as np
 import torch
-from pathlib import Path
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -21,11 +23,15 @@ from .checkpoint import (
     get_rng_state, set_rng_state, save_checkpoint, load_training_state,
 )
 from .validate import run_validation_batch
+from .types import MetadataItem
 from peft import PeftModel
 
 
 
-def _training_batches(train_loader, skip=0):
+def _training_batches(
+    train_loader: DataLoader,
+    skip: int = 0,
+) -> Iterator[dict[str, torch.Tensor]]:
     """Yield batches from DataLoader, skipping `skip` batches first.
 
     Handles epoch boundaries via StopIteration, creating a new iterator
@@ -48,7 +54,11 @@ def _training_batches(train_loader, skip=0):
             yield next(it)
 
 
-def _select_val_subset(val_metadata: list, k: int, seed: int) -> list:
+def _select_val_subset(
+    val_metadata: list[MetadataItem],
+    k: int,
+    seed: int,
+) -> list[MetadataItem]:
     """Deterministic subset selection from validation set."""
     import hashlib
     if len(val_metadata) <= k:
@@ -62,12 +72,16 @@ def _select_val_subset(val_metadata: list, k: int, seed: int) -> list:
     return [val_metadata[i] for i in ranked[:k]]
 
 
-def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Optional[str] = None):
-    transformer_device = config.get("transformer_device", "cuda:0")
-    qwen_device = config.get("qwen_device", "cuda:1")
+def train(
+    config: dict[str, Any],
+    output_dir: str = "outputs/checkpoints",
+    resume_from: Optional[str] = None,
+) -> None:
+    transformer_device = str(config.get("transformer_device", "cuda:0"))
+    qwen_device = str(config.get("qwen_device", "cuda:1"))
 
     # ---- Fixed seed ----
-    seed = config.get("seed", 42)
+    seed = int(config.get("seed", 42))
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -87,13 +101,13 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
 
     # ---- Load models ----
     models = load_models(
-        model_name=config["model_name"],
-        lora_target=config.get("lora_target", "both"),
-        lora_rank=config.get("lora_rank", 16),
-        lora_alpha=config.get("lora_alpha", 8),
+        model_name=str(config["model_name"]),
+        lora_target=str(config.get("lora_target", "both")),
+        lora_rank=int(config.get("lora_rank", 16)),
+        lora_alpha=int(config.get("lora_alpha", 8)),
         transformer_device=transformer_device,
         qwen_device=qwen_device,
-        gradient_checkpointing=config.get("gradient_checkpointing", False),
+        gradient_checkpointing=bool(config.get("gradient_checkpointing", False)),
     )
     vae = models["vae"]
     transformer = models["transformer"]
@@ -104,7 +118,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
 
     # Read transformer config
     transformer_config = transformer.config
-    patch_size = getattr(transformer_config, "patch_size", 1)
+    patch_size = int(getattr(transformer_config, "patch_size", 1))
 
     # ---- Resume ----
     if resume_from is not None:
@@ -135,7 +149,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
     from .dataset import DehazeDataset
 
     all_metadata = [json.loads(l) for l in open(config["train_metadata"])]
-    val_split = config.get("val_split", 0.05)
+    val_split = float(config.get("val_split", 0.05))
     val_items = []
     train_items = []
     threshold = int(val_split * 100)
@@ -165,7 +179,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
 
     train_dataset = DehazeDataset(
         metadata_path=config["train_metadata"],
-        caption_dropout_rate=config.get("caption_dropout_rate", 0.1),
+        caption_dropout_rate=float(config.get("caption_dropout_rate", 0.1)),
         dropout_seed=seed,
         metadata_items=train_items,
     )
@@ -174,8 +188,8 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
             f"Training dataset is empty: {config['train_metadata']}"
         )
 
-    def _seed_worker(worker_id):
-        worker_seed = seed + worker_id
+    def _seed_worker(worker_id: int) -> None:
+        worker_seed = int(seed + worker_id)
         random.seed(worker_seed)
         np.random.seed(worker_seed)
         torch.manual_seed(worker_seed)
@@ -183,7 +197,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
     dl_generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config["batch_size"],
+        batch_size=int(config["batch_size"]),
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -192,7 +206,7 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
     )
 
     # ---- Optimizers ----
-    lora_target = config.get("lora_target", "both")
+    lora_target: str = config.get("lora_target", "both")
     if lora_target not in ("transformer", "qwen", "both"):
         raise ValueError(
             f"Invalid lora_target={lora_target!r}, "
@@ -223,34 +237,34 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
         if opt_states["qwen"] is not None and qwen_opt is not None:
             qwen_opt.load_state_dict(opt_states["qwen"])
 
-    max_seq_len = config.get("max_sequence_length", 512)
-    max_steps = config["max_steps"]
-    save_every = config.get("save_every", 250)
-    log_freq = config.get("log_freq", 10)
+    max_seq_len = int(config.get("max_sequence_length", 512))
+    max_steps = int(config["max_steps"])
+    save_every = int(config.get("save_every", 250))
+    log_freq = int(config.get("log_freq", 10))
     if save_every <= 0 or log_freq <= 0:
         raise ValueError(
             f"save_every ({save_every}) and log_freq ({log_freq}) must be > 0"
         )
-    grad_accum = config["gradient_accumulation_steps"]
+    grad_accum = int(config["gradient_accumulation_steps"])
 
     # ---- wandb ----
     import wandb
 
     exp_name = (
         f"{lora_target}_"
-        f"r{config.get('lora_rank', 16)}_"
+        f"r{int(config.get('lora_rank', 16))}_"
         f"tlr{transformer_lr}_qlr{qwen_lr}_"
         f"seed{seed}"
     )
     wandb.init(
-        project=config.get("wandb_project", "dehaze-flux2-klein"),
+        project=str(config.get("wandb_project", "dehaze-flux2-klein")),
         entity=config.get("wandb_entity"),
-        mode=config.get("wandb_mode", "online"),
+        mode=str(config.get("wandb_mode", "online")),
         name=exp_name,
         config=config,
     )
 
-    def _validate_and_save(save=True):
+    def _validate_and_save(save: bool = True) -> None:
         nonlocal global_step, micro_step
 
         # Run validation (before saving checkpoint)
@@ -259,8 +273,8 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
 
             val_subset = _select_val_subset(
                 val_items,
-                k=config.get("val_subset_size", 4),
-                seed=seed + global_step,
+                k=int(config.get("val_subset_size", 4)),
+                seed=int(seed + global_step),
             )
 
             # Models to eval mode for validation
@@ -275,12 +289,12 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
                 val_subset=val_subset,
-                guidance_scale=config.get("val_guidance_scale", config.get("guidance_scale", 3.5)),
-                num_inference_steps=config.get("val_num_inference_steps", config.get("num_inference_steps", 28)),
+                guidance_scale=float(config.get("val_guidance_scale", config.get("guidance_scale", 3.5))),
+                num_inference_steps=int(config.get("val_num_inference_steps", config.get("num_inference_steps", 28))),
                 max_seq_len=max_seq_len,
                 transformer_device=transformer_device,
                 qwen_device=qwen_device,
-                seed=seed + global_step,
+                seed=int(seed + global_step),
             )
 
             # Restore train mode
@@ -340,8 +354,8 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
             )
 
     print(
-        f"Training: {max_steps} steps, batch={config['batch_size']}, "
-        f"accum={grad_accum}, effective_batch={config['batch_size'] * grad_accum}"
+        f"Training: {max_steps} steps, batch={int(config['batch_size'])}, "
+        f"accum={grad_accum}, effective_batch={int(config['batch_size']) * grad_accum}"
     )
     print(f"Devices: transformer={transformer_device}, qwen={qwen_device}")
 
@@ -451,12 +465,12 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
                     qwen_opt.zero_grad()
 
                 global_step += 1
-                avg_loss = (step_loss / grad_accum).item()
+                avg_loss = float((step_loss / grad_accum).item())
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{avg_loss:.4f}")
 
                 if global_step % log_freq == 0:
-                    cond_ratio = 1.0 - step_uncond / max(step_total, 1)
+                    cond_ratio = float(1.0 - step_uncond / max(step_total, 1))
                     log_dict = {
                         "train/loss": avg_loss,
                         "train/cond_ratio": cond_ratio,
@@ -496,6 +510,6 @@ if __name__ == "__main__":
     config = load_config(args.config)
     train(
         config,
-        output_dir=config.get("output_dir", "outputs/checkpoints"),
+        output_dir=str(config.get("output_dir", "outputs/checkpoints")),
         resume_from=args.resume,
     )

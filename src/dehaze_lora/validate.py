@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -16,15 +20,19 @@ from .model import (
     encode_prompts, encode_vae_image, decode_vae_image,
     patchify_and_make_ids, unpatchify,
 )
+from .types import (
+    ValidationBatchResult, ValidationImageOutput,
+    DenoiseOutput, MetricsDict,
+)
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
 
 
 def load_inference_models(
-    model_name="black-forest-labs/FLUX.2-klein-base-9B",
-    transformer_lora_path=None,
-    qwen_lora_path=None,
-    device="cuda",
-):
+    model_name: str = "black-forest-labs/FLUX.2-klein-base-9B",
+    transformer_lora_path: str | None = None,
+    qwen_lora_path: str | None = None,
+    device: str = "cuda",
+) -> tuple[Any, Any, Any]:  # (VAE, Transformer, Scheduler)
     vae = AutoencoderKLFlux2.from_pretrained(
         model_name, subfolder="vae", torch_dtype=torch.bfloat16
     )
@@ -51,31 +59,27 @@ def load_inference_models(
 
 @torch.no_grad()
 def _denoise_all_modes(
-    transformer,
-    scheduler,
-    vae,
-    hazy_latent,          # BCHW, already VAE-encoded + patchified + BN
-    cond_embeds,          # (B, L, 12288)
-    cond_text_ids,        # (B, L, 4)
-    uncond_embeds,        # (B, L, 12288)
-    uncond_text_ids,      # (B, L, 4)
+    transformer: Any,
+    scheduler: Any,
+    vae: Any,
+    hazy_latent: torch.Tensor,
+    cond_embeds: torch.Tensor,
+    cond_text_ids: torch.Tensor,
+    uncond_embeds: torch.Tensor,
+    uncond_text_ids: torch.Tensor,
     *,
     guidance_scale: float = 3.5,
     num_inference_steps: int = 28,
     device: str = "cuda",
     noise_seed: int = 42,
-) -> dict:
-    """Run 3 denoising trajectories from shared noise: cond, reconstruction, CFG.
-
-    Returns dict with keys 'cond', 'reconstruction', 'cfg' -- each a decoded
-    RGB tensor of shape (B, 3, H', W').
-    """
-    B = hazy_latent.shape[0]
-    ph = hazy_latent.shape[2]
-    pw = hazy_latent.shape[3]
+) -> DenoiseOutput:
+    """Run 3 denoising trajectories from shared noise: cond, reconstruction, CFG."""
+    B = int(hazy_latent.shape[0])
+    ph = int(hazy_latent.shape[2])
+    pw = int(hazy_latent.shape[3])
 
     transformer_config = transformer.config
-    patch_size = getattr(transformer_config, "patch_size", 1)
+    patch_size = int(getattr(transformer_config, "patch_size", 1))
 
     # Shared reference tokens
     ref_tokens, ref_ids = patchify_and_make_ids(
@@ -83,8 +87,8 @@ def _denoise_all_modes(
     )
 
     # Shared starting noise
-    image_seq_len = hazy_latent.shape[2] * hazy_latent.shape[3]
-    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
+    image_seq_len = int(hazy_latent.shape[2] * hazy_latent.shape[3])
+    mu = float(compute_empirical_mu(image_seq_len, num_inference_steps))
     rng = torch.Generator(device).manual_seed(noise_seed)
     z0 = torch.randn_like(hazy_latent, generator=rng)
 
@@ -194,12 +198,12 @@ def _denoise_all_modes(
 
 @torch.no_grad()
 def run_validation_batch(
-    vae,
-    transformer,
-    scheduler,
-    text_encoder,
-    tokenizer,
-    val_subset: list,         # list of metadata dicts (typically 4 items)
+    vae: Any,
+    transformer: Any,
+    scheduler: Any,
+    text_encoder: Any,
+    tokenizer: Any,
+    val_subset: list[dict[str, Any]],
     *,
     guidance_scale: float = 3.5,
     num_inference_steps: int = 28,
@@ -207,22 +211,18 @@ def run_validation_batch(
     transformer_device: str = "cuda:0",
     qwen_device: str = "cuda:1",
     seed: int = 42,
-) -> dict:
+) -> ValidationBatchResult:
     """Run 3-mode validation on a batch of images.
 
     Args:
         val_subset: List of metadata dicts with 'image', 'gt', 'caption' keys.
         seed: Validation noise seed (deterministic per step).
-
-    Returns:
-        dict with keys: 'images' (list of dicts with hazy/gt/cond/recon/cfg tensors),
-        'psnr' (list of floats), 'ssim' (list of floats).
     """
     from .dataset import DEHAZE_PROMPT
     from PIL import Image
     from torchvision import transforms
 
-    bsz = len(val_subset)
+    bsz = int(len(val_subset))
     if bsz == 0:
         return {"images": [], "psnr": [], "ssim": []}
 
@@ -293,8 +293,8 @@ def run_validation_batch(
         cfg_np = results["cfg"][i].permute(1, 2, 0).cpu().float().clamp(0, 1).numpy()
         gt_np = gt_batch[i].permute(1, 2, 0).numpy()
 
-        psnr_list.append(psnr(gt_np, cfg_np, data_range=1.0))
-        ssim_list.append(ssim(gt_np, cfg_np, data_range=1.0, channel_axis=2))
+        psnr_list.append(float(psnr(gt_np, cfg_np, data_range=1.0)))
+        ssim_list.append(float(ssim(gt_np, cfg_np, data_range=1.0, channel_axis=2)))
 
         image_outputs.append({
             "hazy": hazy_batch[i].cpu(),
@@ -310,14 +310,14 @@ def run_validation_batch(
 def validate(
     val_metadata_path: str,
     model_name: str = "black-forest-labs/FLUX.2-klein-base-9B",
-    transformer_lora_path: str = None,
-    qwen_lora_path: str = None,
+    transformer_lora_path: str | None = None,
+    qwen_lora_path: str | None = None,
     output_dir: str = "outputs/eval",
     device: str = "cuda",
     guidance_scale: float = 3.5,
     num_inference_steps: int = 28,
     batch_size: int = 4,
-):
+) -> MetricsDict:
     from transformers import Qwen3ForCausalLM, Qwen2TokenizerFast
 
     all_metadata = [json.loads(l) for l in open(val_metadata_path)]

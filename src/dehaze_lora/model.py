@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch.nn.attention import sdpa_kernel, SDPBackend
 from diffusers import (
     AutoencoderKLFlux2,
     FlowMatchEulerDiscreteScheduler,
@@ -300,13 +299,12 @@ def encode_prompts(
     input_ids = tokens["input_ids"].to(device)
     attention_mask = tokens["attention_mask"].to(device)
 
-    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-        output = text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+    output = text_encoder(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
 
     out = torch.stack(
         [output.hidden_states[k] for k in QWEN3_HIDDEN_STATES_LAYERS], dim=1

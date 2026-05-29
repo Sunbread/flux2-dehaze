@@ -27,6 +27,50 @@ from .types import MetadataItem
 from peft import PeftModel
 
 
+def _split_train_val_metadata(
+    metadata: list[MetadataItem],
+    val_split: float,
+) -> tuple[list[MetadataItem], list[MetadataItem]]:
+    threshold = int(float(val_split) * 100)
+    train_items: list[MetadataItem] = []
+    val_items: list[MetadataItem] = []
+    for item in metadata:
+        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
+        if bucket < threshold:
+            val_items.append(item)
+        else:
+            train_items.append(item)
+    return train_items, val_items
+
+
+def _sample_sigmas_and_noise(
+    shape: torch.Size,
+    batch_size: int,
+    shift: float,
+    seed: int,
+    micro_step: int,
+    device: str,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rng = torch.Generator(device).manual_seed(int(seed) + int(micro_step))
+    z = torch.randn(batch_size, generator=rng, device=device, dtype=torch.float32)
+    sigma_raw = torch.sigmoid(z)
+    sigmas = (sigma_raw * float(shift)) / (1 + (float(shift) - 1) * sigma_raw)
+    noise = torch.randn(shape, generator=rng, device=device, dtype=dtype)
+    return sigmas, noise
+
+
+def _make_noisy_latent(
+    target_latent: torch.Tensor,
+    noise: torch.Tensor,
+    sigmas: torch.Tensor,
+) -> torch.Tensor:
+    bsz = target_latent.shape[0]
+    return (
+        (1.0 - sigmas.view(bsz, 1, 1, 1)) * target_latent
+        + sigmas.view(bsz, 1, 1, 1) * noise
+    )
+
 
 def _training_batches(
     train_loader: DataLoader,
@@ -150,15 +194,7 @@ def train(
 
     all_metadata = [json.loads(l) for l in open(config["train_metadata"])]
     val_split = float(config.get("val_split", 0.05))
-    val_items = []
-    train_items = []
-    threshold = int(val_split * 100)
-    for item in all_metadata:
-        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
-        if bucket < threshold:
-            val_items.append(item)
-        else:
-            train_items.append(item)
+    train_items, val_items = _split_train_val_metadata(all_metadata, val_split)
 
     if len(train_items) == 0:
         raise ValueError(
@@ -395,24 +431,15 @@ def train(
 
             # Timestep and noise (logit-normal + shift, matching Flux2 Klein training)
             # RNG: Generator(seed + micro_step) — deterministic per micro-batch
-            bsz = gt_latent.shape[0]
             shift = scheduler.config.shift  # 3.0 for Flux2 Klein Base
-            rng = torch.Generator(transformer_device).manual_seed(seed + micro_step)
-            z = torch.randn(bsz, generator=rng, device=transformer_device, dtype=torch.float32)
-            sigma_raw = torch.sigmoid(z)  # logit-normal: sigmoid(N(0, 1))
-            sigmas = (sigma_raw * shift) / (1 + (shift - 1) * sigma_raw)
-
-            noise = torch.randn(
-                gt_latent.shape, generator=rng,
-                device=transformer_device, dtype=torch.bfloat16,
+            sigmas, noise = _sample_sigmas_and_noise(
+                gt_latent.shape, gt_latent.shape[0], shift,
+                seed, micro_step, transformer_device, torch.bfloat16,
             )
             # Caption dropout removes only text. The flow target remains GT clear image Y,
             # so empty prompt learns p(Y | I), not p(I | I).
             target_latent = gt_latent
-            noisy_latent = (
-                (1.0 - sigmas.view(bsz, 1, 1, 1)) * target_latent
-                + sigmas.view(bsz, 1, 1, 1) * noise
-            )
+            noisy_latent = _make_noisy_latent(target_latent, noise, sigmas)
 
             # Patchify
             noisy_tokens, noisy_ids = patchify_and_make_ids(

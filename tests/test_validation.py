@@ -1,6 +1,5 @@
 """CPU tests for validation split and subset selection logic."""
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -9,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from dehaze_lora.dataset import DehazeDataset, DEHAZE_PROMPT
+from dehaze_lora.train import _select_val_subset, _split_train_val_metadata
 
 
 def _make_metadata_file(n: int, tmp_path: Path) -> Path:
@@ -24,36 +24,8 @@ def _make_metadata_file(n: int, tmp_path: Path) -> Path:
     return path
 
 
-def _split_metadata(metadata: list, split_ratio: float = 0.05) -> tuple[list, list]:
-    """Deterministic train/val split based on image path hash."""
-    val_items = []
-    train_items = []
-    threshold = int(split_ratio * 100)
-    for item in metadata:
-        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
-        if bucket < threshold:
-            val_items.append(item)
-        else:
-            train_items.append(item)
-    return train_items, val_items
-
-
-def _select_val_subset(val_metadata: list, k: int, seed: int) -> list:
-    """Deterministic subset selection from val set."""
-    import hashlib
-    if len(val_metadata) <= k:
-        return val_metadata
-    indices = list(range(len(val_metadata)))
-    key = f"{seed}".encode()
-    ranked = sorted(
-        indices,
-        key=lambda i: hashlib.md5(key + str(i).encode()).hexdigest(),
-    )
-    return [val_metadata[i] for i in ranked[:k]]
-
-
 class TestValidationSplit:
-    """CPU tests for deterministic train/val split logic."""
+    """CPU tests for deterministic train/val split logic (production helpers)."""
 
     def test_metadata_items_parameter(self, tmp_path):
         """DehazeDataset with metadata_items uses the filtered list."""
@@ -71,12 +43,12 @@ class TestValidationSplit:
         assert ds.metadata[0]["caption"] == DEHAZE_PROMPT
 
     def test_split_deterministic(self, tmp_path):
-        """Same metadata -> same split every time."""
+        """Same metadata -> same split every time via _split_train_val_metadata."""
         meta_path = _make_metadata_file(100, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
 
-        train1, val1 = _split_metadata(all_items, 0.05)
-        train2, val2 = _split_metadata(all_items, 0.05)
+        train1, val1 = _split_train_val_metadata(all_items, 0.05)
+        train2, val2 = _split_train_val_metadata(all_items, 0.05)
 
         assert len(train1) == len(train2)
         assert len(val1) == len(val2)
@@ -87,13 +59,11 @@ class TestValidationSplit:
         """Split does not depend on Python's per-process hash salt."""
         meta_path = _make_metadata_file(1000, tmp_path)
         code = f"""
-import hashlib, json
+import json
+from dehaze_lora.train import _split_train_val_metadata
 items = [json.loads(l) for l in open({str(meta_path)!r})]
-val = []
-for item in items:
-    bucket = int(hashlib.md5(item['image'].encode()).hexdigest(), 16) % 100
-    if bucket < 5:
-        val.append(item['image'])
+_, val_items = _split_train_val_metadata(items, 0.05)
+val = [item['image'] for item in val_items]
 print('\\n'.join(val))
 """
         first = subprocess.check_output([sys.executable, "-c", code], text=True)
@@ -106,7 +76,7 @@ print('\\n'.join(val))
         meta_path = _make_metadata_file(100, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
 
-        train_items, val_items = _split_metadata(all_items, 0.05)
+        train_items, val_items = _split_train_val_metadata(all_items, 0.05)
 
         train_paths = {item["image"] for item in train_items}
         val_paths = {item["image"] for item in val_items}
@@ -117,15 +87,26 @@ print('\\n'.join(val))
         meta_path = _make_metadata_file(1000, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
 
-        _, val_items = _split_metadata(all_items, 0.05)
+        _, val_items = _split_train_val_metadata(all_items, 0.05)
         ratio = len(val_items) / 1000
         assert 0.03 < ratio < 0.07, f"Val ratio {ratio} too far from 0.05"
+
+    def test_split_truncation_behavior(self, tmp_path):
+        """val_split=0.059 uses threshold 5 (truncation, not rounding)."""
+        meta_path = _make_metadata_file(500, tmp_path)
+        all_items = [json.loads(l) for l in open(meta_path)]
+
+        _, val_5 = _split_train_val_metadata(all_items, 0.050)
+        _, val_59 = _split_train_val_metadata(all_items, 0.059)
+
+        # Both use threshold 5, so same split
+        assert [item["image"] for item in val_5] == [item["image"] for item in val_59]
 
     def test_subset_deterministic(self, tmp_path):
         """Same seed -> same subset each call."""
         meta_path = _make_metadata_file(200, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
-        _, val_items = _split_metadata(all_items, 0.05)
+        _, val_items = _split_train_val_metadata(all_items, 0.05)
 
         sub1 = _select_val_subset(val_items, k=4, seed=42)
         sub2 = _select_val_subset(val_items, k=4, seed=42)
@@ -138,7 +119,7 @@ print('\\n'.join(val))
         """Subset size matches k."""
         meta_path = _make_metadata_file(200, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
-        _, val_items = _split_metadata(all_items, 0.05)
+        _, val_items = _split_train_val_metadata(all_items, 0.05)
 
         sub = _select_val_subset(val_items, k=4, seed=42)
         assert len(sub) == 4
@@ -147,7 +128,7 @@ print('\\n'.join(val))
         """When val set smaller than k, returns all val items."""
         meta_path = _make_metadata_file(50, tmp_path)
         all_items = [json.loads(l) for l in open(meta_path)]
-        _, val_items = _split_metadata(all_items, 0.05)
+        _, val_items = _split_train_val_metadata(all_items, 0.05)
 
         sub = _select_val_subset(val_items, k=100, seed=42)
         assert len(sub) == len(val_items)

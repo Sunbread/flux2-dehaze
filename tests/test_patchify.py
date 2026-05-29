@@ -76,6 +76,75 @@ class TestPositionIDs:
         assert ids.device == x.device
 
 
+class TestPatchifyTypeBoundaries:
+    """Boundary: patchify/unpatchify accept numpy int/float types."""
+
+    def test_patchify_accepts_float_index(self):
+        import numpy as np
+        x = torch.randn(2, 128, 4, 4, dtype=torch.float32)
+        tokens, ids = patchify_and_make_ids(
+            x, patch_size=1, index=np.float64(10.0), axes_dim=4,
+        )
+        assert tokens.shape == (2, 16, 128)
+        assert ids.shape == (2, 16, 4)
+        assert ids.dtype == torch.float32
+        assert torch.allclose(ids[:, :, 0], torch.tensor(10.0))
+
+    def test_patchify_works_with_numpy_int_patch_size(self):
+        import numpy as np
+        x = torch.randn(1, 32, 4, 4, dtype=torch.float32)
+        tokens, ids = patchify_and_make_ids(
+            x, patch_size=int(np.int64(1)), index=0.0, axes_dim=4,
+        )
+        assert tokens.shape == (1, 16, 32)
+        assert ids.shape == (1, 16, 4)
+
+    def test_patchify_zero_index(self):
+        x = torch.randn(1, 128, 4, 4, dtype=torch.float32)
+        _tokens, ids = patchify_and_make_ids(x, patch_size=1, index=0, axes_dim=4)
+        assert torch.allclose(ids[:, :, 0], torch.tensor(0.0))
+
+    def test_patchify_ids_always_float32(self):
+        x = torch.randn(1, 128, 4, 4, dtype=torch.float32)
+        _, ids = patchify_and_make_ids(x, patch_size=1, index=10.0, axes_dim=4)
+        assert ids.dtype == torch.float32
+
+    def test_patchify_ids_index_preserved(self):
+        import numpy as np
+        x = torch.randn(1, 128, 4, 4, dtype=torch.float32)
+        _, ids = patchify_and_make_ids(
+            x, patch_size=1, index=np.float32(10.0), axes_dim=4,
+        )
+        assert ids[:, :, 0].unique().item() == pytest.approx(10.0)
+        assert ids[:, :, 3].unique().item() == pytest.approx(0.0)
+
+    def test_unpatchify_with_numpy_int64_hw(self):
+        import numpy as np
+        x = torch.randn(1, 1, 128, dtype=torch.float32)
+        result = unpatchify(x, np.int64(1), np.int64(1), patch_size=1)
+        assert result.shape == (1, 128, 1, 1)
+
+    def test_unpatchify_roundtrip_with_numpy_boundaries(self):
+        import numpy as np
+        original = torch.randn(2, 128, 4, 8, dtype=torch.float32)
+        tokens, _ids = patchify_and_make_ids(original, patch_size=1, index=0.0)
+        recovered = unpatchify(
+            tokens,
+            h_orig=np.int32(4),
+            w_orig=np.int32(8),
+            patch_size=np.int32(1),
+        )
+        assert recovered.shape == original.shape
+
+    def test_unpatchify_from_tensor_shape_boundaries(self):
+        original = torch.randn(2, 128, 4, 8, dtype=torch.float32)
+        tokens, _ids = patchify_and_make_ids(original, patch_size=1, index=0.0)
+        h = int(original.shape[2])
+        w = int(original.shape[3])
+        recovered = unpatchify(tokens, h, w, patch_size=1)
+        assert recovered.shape == original.shape
+
+
 class TestPatchifyEdgeCases:
     def test_single_pixel(self):
         """1x1 latent should work."""

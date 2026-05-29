@@ -57,6 +57,42 @@ def load_inference_models(
     return vae, transformer, scheduler
 
 
+def _apply_cfg(
+    v_cond: torch.Tensor,
+    v_uncond: torch.Tensor,
+    guidance_scale: float,
+) -> torch.Tensor:
+    return v_uncond + float(guidance_scale) * (v_cond - v_uncond)
+
+
+def _concat_image_and_ref_tokens(
+    noisy_latent: torch.Tensor,
+    ref_tokens: torch.Tensor,
+    ref_ids: torch.Tensor,
+    patch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    noisy_tokens, noisy_ids = patchify_and_make_ids(
+        noisy_latent, patch_size=patch_size, index=0.0,
+    )
+    return (
+        torch.cat([noisy_tokens, ref_tokens], dim=1),
+        torch.cat([noisy_ids, ref_ids], dim=1),
+        noisy_tokens.shape[1],
+    )
+
+
+def _compute_image_metrics(
+    gt: torch.Tensor,
+    pred: torch.Tensor,
+) -> tuple[float, float]:
+    pred_np = pred.permute(1, 2, 0).cpu().float().clamp(0, 1).numpy()
+    gt_np = gt.permute(1, 2, 0).cpu().float().numpy()
+    return (
+        float(psnr(gt_np, pred_np, data_range=1.0)),
+        float(ssim(gt_np, pred_np, data_range=1.0, channel_axis=2)),
+    )
+
+
 @torch.no_grad()
 def _denoise_all_modes(
     transformer: Any,
@@ -107,19 +143,19 @@ def _denoise_all_modes(
             .to(device=device, dtype=torch.bfloat16)
             / scheduler.config.num_train_timesteps
         )
-        noisy_tokens, noisy_ids = patchify_and_make_ids(
-            z_cond, patch_size=patch_size, index=0.0,
+        img_hidden, img_ids_combined, N_noisy = _concat_image_and_ref_tokens(
+            z_cond, ref_tokens, ref_ids, patch_size,
         )
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             v = transformer(
-                hidden_states=torch.cat([noisy_tokens, ref_tokens], dim=1),
+                hidden_states=img_hidden,
                 encoder_hidden_states=cond_embeds,
                 timestep=timestep,
-                img_ids=torch.cat([noisy_ids, ref_ids], dim=1),
+                img_ids=img_ids_combined,
                 txt_ids=cond_text_ids,
                 return_dict=False,
             )[0]
-        v = v[:, : noisy_tokens.shape[1], :]
+        v = v[:, :N_noisy, :]
         v = unpatchify(v, ph, pw, patch_size=patch_size)
         z_cond = sched.step(v, t, z_cond).prev_sample
     cond_img = decode_vae_image(vae, z_cond)
@@ -133,19 +169,19 @@ def _denoise_all_modes(
             .to(device=device, dtype=torch.bfloat16)
             / scheduler.config.num_train_timesteps
         )
-        noisy_tokens, noisy_ids = patchify_and_make_ids(
-            z_uncond, patch_size=patch_size, index=0.0,
+        img_hidden, img_ids_combined, N_noisy = _concat_image_and_ref_tokens(
+            z_uncond, ref_tokens, ref_ids, patch_size,
         )
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             v = transformer(
-                hidden_states=torch.cat([noisy_tokens, ref_tokens], dim=1),
+                hidden_states=img_hidden,
                 encoder_hidden_states=uncond_embeds,
                 timestep=timestep,
-                img_ids=torch.cat([noisy_ids, ref_ids], dim=1),
+                img_ids=img_ids_combined,
                 txt_ids=uncond_text_ids,
                 return_dict=False,
             )[0]
-        v = v[:, : noisy_tokens.shape[1], :]
+        v = v[:, :N_noisy, :]
         v = unpatchify(v, ph, pw, patch_size=patch_size)
         z_uncond = sched.step(v, t, z_uncond).prev_sample
     uncond_img = decode_vae_image(vae, z_uncond)
@@ -159,11 +195,9 @@ def _denoise_all_modes(
             .to(device=device, dtype=torch.bfloat16)
             / scheduler.config.num_train_timesteps
         )
-        noisy_tokens, noisy_ids = patchify_and_make_ids(
-            z_cfg, patch_size=patch_size, index=0.0,
+        img_hidden, img_ids_combined, N_noisy = _concat_image_and_ref_tokens(
+            z_cfg, ref_tokens, ref_ids, patch_size,
         )
-        img_hidden = torch.cat([noisy_tokens, ref_tokens], dim=1)
-        img_ids_combined = torch.cat([noisy_ids, ref_ids], dim=1)
 
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             v_cond = transformer(
@@ -174,7 +208,7 @@ def _denoise_all_modes(
                 txt_ids=cond_text_ids,
                 return_dict=False,
             )[0]
-        v_cond = v_cond[:, : noisy_tokens.shape[1], :]
+        v_cond = v_cond[:, :N_noisy, :]
         v_cond = unpatchify(v_cond, ph, pw, patch_size=patch_size)
 
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -186,10 +220,10 @@ def _denoise_all_modes(
                 txt_ids=uncond_text_ids,
                 return_dict=False,
             )[0]
-        v_uncond = v_uncond[:, : noisy_tokens.shape[1], :]
+        v_uncond = v_uncond[:, :N_noisy, :]
         v_uncond = unpatchify(v_uncond, ph, pw, patch_size=patch_size)
 
-        v_cfg = v_uncond + guidance_scale * (v_cond - v_uncond)
+        v_cfg = _apply_cfg(v_cond, v_uncond, guidance_scale)
         z_cfg = sched.step(v_cfg, t, z_cfg).prev_sample
     cfg_img = decode_vae_image(vae, z_cfg)
 
@@ -290,11 +324,9 @@ def run_validation_batch(
     psnr_list, ssim_list = [], []
     image_outputs = []
     for i in range(bsz):
-        cfg_np = results["cfg"][i].permute(1, 2, 0).cpu().float().clamp(0, 1).numpy()
-        gt_np = gt_batch[i].permute(1, 2, 0).numpy()
-
-        psnr_list.append(float(psnr(gt_np, cfg_np, data_range=1.0)))
-        ssim_list.append(float(ssim(gt_np, cfg_np, data_range=1.0, channel_axis=2)))
+        p, s = _compute_image_metrics(gt_batch[i], results["cfg"][i])
+        psnr_list.append(p)
+        ssim_list.append(s)
 
         image_outputs.append({
             "hazy": hazy_batch[i].cpu(),

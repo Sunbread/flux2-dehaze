@@ -11,6 +11,7 @@ import torch
 from dehaze_lora.loss import flow_matching_loss
 from dehaze_lora.model import patchify_and_make_ids, unpatchify
 from dehaze_lora.optimizer import create_optimizer
+from dehaze_lora.train import _make_noisy_latent
 from tests.conftest import _require_vram_gb, _require_cuda, cleanup_gpu, \
     load_flux2_transformer, MODEL_NAME
 
@@ -24,12 +25,13 @@ class TestSyntheticTrainingStep:
     def test_flow_matching_training_step(self):
         B, C, H, W = 2, 128, 16, 16
         clean_latent = torch.randn(B, C, H, W)
+        hazy_latent = torch.randn(B, C, H, W)
         noise = torch.randn(B, C, H, W)
         sigma = 0.5
         noisy_latent = (1 - sigma) * clean_latent + sigma * noise
 
         noisy_tokens, noisy_ids = patchify_and_make_ids(noisy_latent, patch_size=1, index=0.0)
-        ref_tokens, ref_ids = patchify_and_make_ids(clean_latent, patch_size=1, index=10.0)
+        ref_tokens, ref_ids = patchify_and_make_ids(hazy_latent, patch_size=1, index=10.0)
 
         hidden_states = torch.cat([noisy_tokens, ref_tokens], dim=1)
         img_ids = torch.cat([noisy_ids, ref_ids], dim=1)
@@ -122,18 +124,12 @@ class TestSyntheticTrainingStep:
 
         sigma = torch.tensor([0.3, 0.7])
 
-        # Both samples noised from gt_latent
-        noisy_correct = (
-            (1.0 - sigma.view(B, 1, 1, 1)) * gt_latent
-            + sigma.view(B, 1, 1, 1) * noise
-        )
+        # Both samples noised from gt_latent via production helper
+        noisy_correct = _make_noisy_latent(gt_latent, noise, sigma)
         target_correct = noise - gt_latent
 
         # Wrong: noising from hazy_latent
-        noisy_wrong = (
-            (1.0 - sigma.view(B, 1, 1, 1)) * hazy_latent
-            + sigma.view(B, 1, 1, 1) * noise
-        )
+        noisy_wrong = _make_noisy_latent(hazy_latent, noise, sigma)
         target_wrong = noise - hazy_latent
 
         # The correct path uses gt_latent for both samples (same as conditional)

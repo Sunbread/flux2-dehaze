@@ -4,6 +4,7 @@ import json
 import random
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -13,10 +14,11 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from dehaze_lora.model import _inject_lora, TRANSFORMER_LORA_MODULES
 from dehaze_lora.checkpoint import (
-    get_rng_state, set_rng_state, load_training_state,
+    get_rng_state, set_rng_state, load_training_state, save_checkpoint,
 )
 from dehaze_lora.optimizer import create_optimizer
-from dehaze_lora.train import _training_batches
+from dehaze_lora.train import _training_batches, _sample_sigmas_and_noise
+from dehaze_lora.utils import load_config
 from tests.conftest import _require_vram_gb, _require_cuda, cleanup_gpu, load_flux2_transformer
 
 
@@ -180,11 +182,25 @@ class TinyLoRAModel(torch.nn.Module):
         return x @ self.lora_A @ self.lora_B
 
 
+class FakePeftModelForSave(torch.nn.Module):
+    """Fake model that records save_pretrained calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.lora_A = torch.nn.Parameter(torch.randn(16, 8))
+        self.lora_B = torch.nn.Parameter(torch.randn(8, 16))
+
+    def save_pretrained(self, path):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "adapter_config.json").write_text('{"r": 4}')
+        (Path(path) / "adapter_model.safetensors").write_text("fake")
+
+
 class TestCheckpointResume:
     """CPU tests: bit-identical training after checkpoint resume."""
 
     def test_rng_state_roundtrip(self):
-        """get_rng_state() → set_rng_state() produces identical RNG output."""
+        """get_rng_state() -> set_rng_state() produces identical RNG output."""
         random.seed(42)
         np.random.seed(42)
         torch.manual_seed(42)
@@ -277,7 +293,6 @@ class TestCheckpointResume:
                 opt_b.zero_grad()
 
         rng_state = get_rng_state()
-        # Save training state manually (TinyLoRAModel has no save_pretrained)
         ckpt_dir = tmp_dir / "checkpoint-3"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         training_state = {
@@ -324,37 +339,146 @@ class TestCheckpointResume:
     def test_noise_rng_consistent_after_resume(self):
         """Noise/timestep at micro_step=M is identical after resume.
 
-        The training loop uses Generator(device).manual_seed(seed + micro_step)
-        for timestep and noise. This must produce bit-identical values when
-        micro_step is restored from a checkpoint.
+        Uses production _sample_sigmas_and_noise (logit-normal + shift).
         """
         seed = 42
-        B, C, H, W = 4, 128, 32, 32  # dummy latent shape
+        B, C, H, W = 4, 128, 32, 32
+        shift = 3.0
 
-        # Simulate training: record noise at micro_steps 0..15
+        # Simulate training: record noise at micro_steps 0..31
         noises_from_scratch = {}
-        timesteps_from_scratch = {}
+        sigmas_from_scratch = {}
         for ms in range(32):
-            rng = torch.Generator("cpu").manual_seed(seed + ms)
-            t = torch.randint(0, 1000, (B,), generator=rng)
-            noise = torch.randn(B, C, H, W, generator=rng)
-            if ms % 8 == 0:  # record at optimizer step boundaries
+            sigmas, noise = _sample_sigmas_and_noise(
+                torch.Size((B, C, H, W)), B, shift, seed, ms, "cpu", torch.float32,
+            )
+            if ms % 8 == 0:
                 noises_from_scratch[ms] = noise.clone()
-                timesteps_from_scratch[ms] = t.clone()
+                sigmas_from_scratch[ms] = sigmas.clone()
 
-        # Simulate resume at micro_step=16:
-        # "Save checkpoint" — just record micro_step
+        # Simulate resume at micro_step=16
         saved_micro_step = 16
 
-        # "Resume" — restore micro_step, continue from micro_step=16
         for ms in range(saved_micro_step, 32):
-            rng = torch.Generator("cpu").manual_seed(seed + ms)
-            t = torch.randint(0, 1000, (B,), generator=rng)
-            noise = torch.randn(B, C, H, W, generator=rng)
+            sigmas, noise = _sample_sigmas_and_noise(
+                torch.Size((B, C, H, W)), B, shift, seed, ms, "cpu", torch.float32,
+            )
             if ms % 8 == 0:
                 assert torch.equal(noises_from_scratch[ms], noise), (
                     f"Noise mismatch at micro_step={ms} after resume"
                 )
-                assert torch.equal(timesteps_from_scratch[ms], t), (
-                    f"Timestep mismatch at micro_step={ms} after resume"
+                assert torch.equal(sigmas_from_scratch[ms], sigmas), (
+                    f"Sigma mismatch at micro_step={ms} after resume"
                 )
+
+    def test_save_checkpoint_cpu(self, tmp_dir):
+        """save_checkpoint writes all expected files with fake objects."""
+        fake_transformer = FakePeftModelForSave()
+        ckpt_dir = tmp_dir / "checkpoints"
+
+        rng_state = get_rng_state()
+        save_checkpoint(
+            transformer=fake_transformer,
+            text_encoder="not_peft",  # not a PeftModel -> no qwen_lora dir
+            step=100,
+            output_dir=str(ckpt_dir),
+            global_step=100,
+            micro_step=400,
+            rng_state=rng_state,
+            transformer_opt=None,
+            qwen_opt=None,
+            config={"key": "value"},
+        )
+
+        saved = ckpt_dir / "checkpoint-100"
+        assert saved.exists()
+        assert (saved / "transformer_lora").exists()
+        assert (saved / "training_state.pt").exists()
+        assert (saved / "config.yaml").exists()
+
+        # qwen_lora should NOT exist (text_encoder is not PeftModel)
+        assert not (saved / "qwen_lora").exists()
+
+        # Verify training_state.pt contents
+        state = load_training_state(saved)
+        assert state["global_step"] == 100
+        assert state["micro_step"] == 400
+        assert "rng_states" in state
+        assert "optimizer_states" in state
+
+        # Verify config.yaml roundtrips
+        config = load_config(saved / "config.yaml")
+        assert config == {"key": "value"}
+
+    def test_save_checkpoint_with_qwen_lora(self, tmp_dir):
+        """save_checkpoint creates qwen_lora dir when text_encoder is PeftModel."""
+        from dehaze_lora.model import _inject_lora
+        from tests.conftest import TinyAttention, TinyQwenAttention
+
+        trans = _inject_lora(TinyAttention(), rank=4, alpha=8, target_modules=["to_q", "to_k"])
+        qwen = _inject_lora(TinyQwenAttention(), rank=4, alpha=8, target_modules=["q_proj", "v_proj"])
+        ckpt_dir = tmp_dir / "checkpoints"
+
+        save_checkpoint(
+            transformer=trans,
+            text_encoder=qwen,
+            step=50,
+            output_dir=str(ckpt_dir),
+            global_step=50,
+            micro_step=200,
+            rng_state=get_rng_state(),
+            transformer_opt=None,
+            qwen_opt=None,
+            config={"lr": 1e-3},
+        )
+
+        saved = ckpt_dir / "checkpoint-50"
+        assert (saved / "transformer_lora").exists()
+        assert (saved / "qwen_lora").exists()
+        assert (saved / "training_state.pt").exists()
+
+    def test_load_training_state_accepts_str(self, tmp_dir):
+        """load_training_state accepts str path to checkpoint dir."""
+        ckpt = tmp_dir / "checkpoint"
+        ckpt.mkdir()
+        torch.save(
+            {"global_step": 0, "micro_step": 0, "rng_states": {}, "optimizer_states": {}},
+            ckpt / "training_state.pt",
+        )
+        state = load_training_state(str(ckpt))
+        assert state["global_step"] == 0
+
+    def test_load_training_state_accepts_path(self, tmp_dir):
+        """load_training_state accepts Path object."""
+        ckpt = tmp_dir / "checkpoint"
+        ckpt.mkdir()
+        torch.save(
+            {"global_step": 5, "micro_step": 3, "rng_states": {}, "optimizer_states": {}},
+            ckpt / "training_state.pt",
+        )
+        state = load_training_state(ckpt)
+        assert state["global_step"] == 5
+        assert state["micro_step"] == 3
+
+    def test_get_rng_state_keys(self):
+        """get_rng_state returns expected keys."""
+        state = get_rng_state()
+        assert "python_random" in state
+        assert "numpy" in state
+        assert "torch_cpu" in state
+        assert "torch_cuda" in state
+
+    def test_set_rng_state_roundtrip(self):
+        """Capture -> set -> capture is idempotent for python random state."""
+        random.seed(42)
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        state_before = get_rng_state()
+        for _ in range(10):
+            random.random()
+            torch.randn(1)
+        set_rng_state(state_before)
+
+        state_after = get_rng_state()
+        assert state_before["python_random"] == state_after["python_random"]

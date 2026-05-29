@@ -9,7 +9,7 @@ from transformers import Qwen3ForCausalLM, Qwen2TokenizerFast
 from peft import LoraConfig, get_peft_model
 
 QWEN_LORA_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
-TRANSFORMER_LORA_MODULES = ["to_q", "to_k", "to_v", "to_out.0"]
+TRANSFORMER_LORA_MODULES = ["to_q", "to_k", "to_v", "to_out.0", "to_qkv_mlp_proj"]
 
 # Flux2 Klein uses Qwen3 hidden states from these layers, concatenated
 QWEN3_HIDDEN_STATES_LAYERS = (9, 18, 27)

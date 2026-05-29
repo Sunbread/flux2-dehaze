@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import random
 from typing import Optional
@@ -139,7 +140,8 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
     train_items = []
     threshold = int(val_split * 100)
     for item in all_metadata:
-        if hash(item["image"]) % 100 < threshold:
+        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
+        if bucket < threshold:
             val_items.append(item)
         else:
             train_items.append(item)
@@ -301,6 +303,16 @@ def train(config: dict, output_dir: str = "outputs/checkpoints", resume_from: Op
                         img_dict["reconstruction"],
                         img_dict["cfg"],
                     ], dim=2)  # horizontal concatenation
+                    comparison = (
+                        comparison.detach()
+                        .float()
+                        .clamp(0, 1)
+                        .mul(255)
+                        .byte()
+                        .permute(1, 2, 0)
+                        .cpu()
+                        .numpy()
+                    )
                     wandb_images.append(
                         wandb.Image(comparison, caption=f"val_{j}")
                     )

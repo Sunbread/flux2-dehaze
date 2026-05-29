@@ -19,7 +19,7 @@ class DehazeDataset(Dataset):
     Dehazing training dataset.
 
     90% samples use dehaze prompt, 10% caption set to "" (CFG unconditional branch).
-    Empty caption is later wrapped by encode_prompt's chat template.
+    Empty caption is later wrapped by encode_prompts's chat template.
     """
 
     def __init__(

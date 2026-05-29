@@ -1,8 +1,7 @@
 """Tests for CFG two-pass inference orchestration logic.
 
-Uses a mock transformer to test the dehaze_single flow without loading
-any real models. Verifies token concatenation, CFG formula, output slicing,
-and scheduler integration.
+Verifies token concatenation, CFG formula, output slicing,
+and scheduler integration with mocked models.
 """
 
 import pytest
@@ -157,10 +156,10 @@ class TestSchedulerIntegration:
 # ---------------------------------------------------------------------------
 
 class TestDehazeOrchestration:
-    """Test the dehaze_single orchestration logic with a mocked transformer."""
+    """Test the CFG denoising orchestration logic with a mocked transformer."""
 
     def test_cfg_loop_orchestration(self):
-        """Simulate one denoising step of dehaze_single with mocked models."""
+        """Simulate one denoising step with mocked models."""
         from diffusers import FlowMatchEulerDiscreteScheduler
 
         B, C, H, W = 1, 128, 8, 8

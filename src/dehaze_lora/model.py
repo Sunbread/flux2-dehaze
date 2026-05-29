@@ -200,9 +200,12 @@ def encode_vae_image(vae, image: torch.Tensor) -> torch.Tensor:
     required by the transformer which expects zero-mean unit-variance latents.
 
     VAE expects input in [-1, 1]; image is normalized from [0, 1].
+
+    Uses latent_dist.mode() (deterministic mean, matching diffusers/comfy/
+    simpletuner). VAE is frozen — no reason to sample noise from the posterior.
     """
     image = image * 2.0 - 1.0  # [0, 1] → [-1, 1]
-    latents = vae.encode(image).latent_dist.sample()
+    latents = vae.encode(image).latent_dist.mode()
     latents = _patchify_latents(latents)
 
     bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
@@ -225,18 +228,6 @@ def decode_vae_image(vae, latents: torch.Tensor) -> torch.Tensor:
     image = vae.decode(latents).sample
     image = (image + 1.0) / 2.0  # [-1, 1] → [0, 1]
     return image
-
-
-def encode_prompt(
-    text_encoder,
-    tokenizer,
-    prompt: str,
-    max_seq_len: int = 512,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
-):
-    """Encode a single prompt. Use encode_prompts for batched encoding."""
-    return encode_prompts(text_encoder, tokenizer, [prompt], max_seq_len, device, dtype)
 
 
 def encode_prompts(

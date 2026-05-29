@@ -1,6 +1,9 @@
 """CPU tests for validation split and subset selection logic."""
 
+import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,7 +30,8 @@ def _split_metadata(metadata: list, split_ratio: float = 0.05) -> tuple[list, li
     train_items = []
     threshold = int(split_ratio * 100)
     for item in metadata:
-        if hash(item["image"]) % 100 < threshold:
+        bucket = int(hashlib.md5(item["image"].encode()).hexdigest(), 16) % 100
+        if bucket < threshold:
             val_items.append(item)
         else:
             train_items.append(item)
@@ -78,6 +82,24 @@ class TestValidationSplit:
         assert len(val1) == len(val2)
         for a, b in zip(val1, val2):
             assert a["image"] == b["image"]
+
+    def test_split_stable_across_python_processes(self, tmp_path):
+        """Split does not depend on Python's per-process hash salt."""
+        meta_path = _make_metadata_file(1000, tmp_path)
+        code = f"""
+import hashlib, json
+items = [json.loads(l) for l in open({str(meta_path)!r})]
+val = []
+for item in items:
+    bucket = int(hashlib.md5(item['image'].encode()).hexdigest(), 16) % 100
+    if bucket < 5:
+        val.append(item['image'])
+print('\\n'.join(val))
+"""
+        first = subprocess.check_output([sys.executable, "-c", code], text=True)
+        second = subprocess.check_output([sys.executable, "-c", code], text=True)
+
+        assert first == second
 
     def test_split_no_overlap(self, tmp_path):
         """Train and val sets are disjoint."""

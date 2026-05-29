@@ -1,6 +1,6 @@
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.data import DataLoader
+
 from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux2Transformer2DModel
 from peft import PeftModel
 from tqdm import tqdm
@@ -8,12 +8,12 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import json
-import contextlib
+
 import os
 from pathlib import Path
 
 from .model import (
-    encode_prompt, encode_vae_image, decode_vae_image,
+    encode_prompts, encode_vae_image, decode_vae_image,
     patchify_and_make_ids, unpatchify,
 )
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
@@ -47,108 +47,6 @@ def load_inference_models(
     )
 
     return vae, transformer, scheduler
-
-
-@torch.no_grad()
-def dehaze_single(
-    vae,
-    transformer,
-    scheduler,
-    text_encoder,
-    tokenizer,
-    hazy_image: torch.Tensor,
-    prompt: str,
-    guidance_scale: float = 3.5,
-    num_inference_steps: int = 28,
-    device: str = "cuda",
-):
-    """
-    Dehaze inference with two-pass CFG.
-
-    v_cfg = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-    Reference image (hazy) in both conditional and unconditional branches.
-    Pure noise start, not from hazy latent.
-    """
-    bsz = hazy_image.shape[0]
-
-    transformer_config = transformer.config
-    patch_size = getattr(transformer_config, "patch_size", 1)
-
-    # VAE encode reference image (patchify + BN normalize)
-    hazy_latent = encode_vae_image(vae, hazy_image.to(device, dtype=torch.bfloat16))
-
-    # Encode text for both conditional and unconditional branches
-    cond_embeds, cond_text_ids = encode_prompt(
-        text_encoder, tokenizer, prompt, 512, device, torch.bfloat16,
-    )
-    uncond_embeds, uncond_text_ids = encode_prompt(
-        text_encoder, tokenizer, "", 512, device, torch.bfloat16,
-    )
-
-    # Reference image tokens (precompute once, same for both branches)
-    ref_tokens, ref_ids = patchify_and_make_ids(
-        hazy_latent, patch_size=patch_size, index=10.0,
-    )
-
-    # Start from pure noise
-    image_seq_len = hazy_latent.shape[2] * hazy_latent.shape[3]
-    mu = compute_empirical_mu(image_seq_len, num_inference_steps)
-    scheduler.set_timesteps(num_inference_steps, mu=mu)
-    z = torch.randn_like(hazy_latent)
-
-    for t in tqdm(scheduler.timesteps, desc="Denoising"):
-        noisy_tokens, noisy_ids = patchify_and_make_ids(
-            z, patch_size=patch_size, index=0.0,
-        )
-
-        # Shared image tokens (noisy + ref)
-        img_hidden = torch.cat([noisy_tokens, ref_tokens], dim=1)
-        img_ids_combined = torch.cat([noisy_ids, ref_ids], dim=1)
-
-        timestep = (
-            t.float().unsqueeze(0).to(device=device, dtype=torch.bfloat16)
-            / scheduler.config.num_train_timesteps
-        )
-
-        # Conditional forward
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            v_cond = transformer(
-                hidden_states=img_hidden,
-                encoder_hidden_states=cond_embeds,
-                timestep=timestep,
-                img_ids=img_ids_combined,
-                txt_ids=cond_text_ids,
-                return_dict=False,
-            )[0]
-        v_cond = v_cond[:, : noisy_tokens.shape[1], :]
-        v_cond = unpatchify(
-            v_cond, z.shape[2], z.shape[3], patch_size=patch_size,
-        )
-
-        # Unconditional forward
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            v_uncond = transformer(
-                hidden_states=img_hidden,
-                encoder_hidden_states=uncond_embeds,
-                timestep=timestep,
-                img_ids=img_ids_combined,
-                txt_ids=uncond_text_ids,
-                return_dict=False,
-            )[0]
-        v_uncond = v_uncond[:, : noisy_tokens.shape[1], :]
-        v_uncond = unpatchify(
-            v_uncond, z.shape[2], z.shape[3], patch_size=patch_size,
-        )
-
-        # CFG
-        v_cfg = v_uncond + guidance_scale * (v_cond - v_uncond)
-
-        # Scheduler step (Flux2 VAE: no shift/scale)
-        z = scheduler.step(v_cfg, t, z).prev_sample
-
-    # VAE decode (denormalize -> unpatchify -> decode)
-    return decode_vae_image(vae, z)
 
 
 @torch.no_grad()
@@ -357,12 +255,12 @@ def run_validation_batch(
     hazy_latent = encode_vae_image(vae, hazy_batch)
 
     # Text encode cond + uncond (once per batch, same prompt for all images)
-    ce, cti = encode_prompt(
+    ce, cti = encode_prompts(
         text_encoder, tokenizer,
         [DEHAZE_PROMPT] * bsz,
         max_seq_len, qwen_device, torch.bfloat16,
     )
-    ue, uti = encode_prompt(
+    ue, uti = encode_prompts(
         text_encoder, tokenizer,
         [""] * bsz,
         max_seq_len, qwen_device, torch.bfloat16,
@@ -418,14 +316,15 @@ def validate(
     device: str = "cuda",
     guidance_scale: float = 3.5,
     num_inference_steps: int = 28,
+    batch_size: int = 4,
 ):
-    from .dataset import DehazeValDataset
     from transformers import Qwen3ForCausalLM, Qwen2TokenizerFast
 
-    val_dataset = DehazeValDataset(val_metadata_path)
-    if len(val_dataset) == 0:
+    all_metadata = [json.loads(l) for l in open(val_metadata_path)]
+    if not all_metadata:
         raise ValueError(f"Validation dataset is empty: {val_metadata_path}")
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+
+    print(f"Loaded {len(all_metadata)} validation samples")
 
     vae, transformer, scheduler = load_inference_models(
         model_name, transformer_lora_path, qwen_lora_path, device,
@@ -446,47 +345,37 @@ def validate(
     )
 
     os.makedirs(output_dir, exist_ok=True)
-    psnr_list, ssim_list = [], []
 
-    for batch in tqdm(val_loader, desc="Validating"):
-        hazy = batch["hazy"]
-        gt = batch["gt"]
-        caption = (
-            batch["caption"][0]
-            if isinstance(batch["caption"], list)
-            else batch["caption"]
-        )
+    all_psnr = []
+    all_ssim = []
 
-        clear = dehaze_single(
+    for i in tqdm(range(0, len(all_metadata), batch_size), desc="Validating"):
+        batch = all_metadata[i:i + batch_size]
+        results = run_validation_batch(
             vae=vae,
             transformer=transformer,
             scheduler=scheduler,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
-            hazy_image=hazy,
-            prompt=caption,
+            val_subset=batch,
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
-            device=device,
+            transformer_device=device,
+            qwen_device=device,
+            seed=42 + i // batch_size,
         )
+        all_psnr.extend(results["psnr"])
+        all_ssim.extend(results["ssim"])
 
-        clear_np = clear.squeeze(0).permute(1, 2, 0).cpu().float().clamp(0, 1).numpy()
-        gt_np = gt.squeeze(0).permute(1, 2, 0).numpy()
-
-        psnr_val = psnr(gt_np, clear_np, data_range=1.0)
-        ssim_val = ssim(gt_np, clear_np, data_range=1.0, channel_axis=2)
-        psnr_list.append(psnr_val)
-        ssim_list.append(ssim_val)
-
-    results = {
-        "mean_psnr": float(np.mean(psnr_list)),
-        "mean_ssim": float(np.mean(ssim_list)),
+    results_dict = {
+        "mean_psnr": float(np.mean(all_psnr)),
+        "mean_ssim": float(np.mean(all_ssim)),
     }
     with open(Path(output_dir) / "metrics.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(results_dict, f, indent=2)
 
     print(
-        f"Mean PSNR: {results['mean_psnr']:.2f} dB | "
-        f"Mean SSIM: {results['mean_ssim']:.4f}"
+        f"Mean PSNR: {results_dict['mean_psnr']:.2f} dB | "
+        f"Mean SSIM: {results_dict['mean_ssim']:.4f}"
     )
-    return results
+    return results_dict

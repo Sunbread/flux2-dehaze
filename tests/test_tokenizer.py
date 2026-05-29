@@ -25,7 +25,7 @@ def tokenizer():
 class TestChatTemplate:
     """Verify apply_chat_template output structure.
 
-    Uses the same arguments as encode_prompt so the template rendering
+    Uses the same arguments as encode_prompts so the template rendering
     path is shared with production code.
     """
 
@@ -102,7 +102,7 @@ class TestTokenizer:
 
 
 # ---------------------------------------------------------------------------
-# Text ID generation (replicates encode_prompt logic)
+# Text ID generation (replicates encode_prompts logic)
 # ---------------------------------------------------------------------------
 
 class TestTextIDGeneration:

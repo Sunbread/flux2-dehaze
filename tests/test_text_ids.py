@@ -8,7 +8,7 @@ import pytest
 
 
 def _make_text_ids(seq_len, device="cpu", dtype=torch.float32):
-    """Replicate encode_prompt text_ids logic for isolated testing."""
+    """Replicate encode_prompts text_ids logic for isolated testing."""
     text_ids = torch.zeros(seq_len, 4, device=device, dtype=dtype)
     text_ids[:, 3] = torch.linspace(
         0, seq_len - 1, steps=seq_len, device=device, dtype=dtype

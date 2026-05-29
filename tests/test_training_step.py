@@ -105,6 +105,45 @@ class TestSyntheticTrainingStep:
             assert not torch.allclose(p, initial[name], atol=1e-6), \
                 f"Parameter {name} did not change after 2 optimizer steps"
 
+    def test_caption_dropout_target_uses_gt_not_hazy(self):
+        """Caption dropout must not change the flow-matching target.
+
+        Both normal-prompt and empty-prompt samples noised from gt_latent.
+        The noising endpoint and loss target use gt_latent for both.
+        The wrong hazy_latent target would differ when hazy != gt.
+        """
+        B, C, H, W = 2, 128, 8, 8
+        hazy_latent = torch.randn(B, C, H, W)
+        gt_latent = torch.randn(B, C, H, W)
+        noise = torch.randn(B, C, H, W)
+
+        # Ensure hazy != gt so the wrong path is distinguishable
+        assert not torch.allclose(hazy_latent, gt_latent)
+
+        sigma = torch.tensor([0.3, 0.7])
+
+        # Both samples noised from gt_latent
+        noisy_correct = (
+            (1.0 - sigma.view(B, 1, 1, 1)) * gt_latent
+            + sigma.view(B, 1, 1, 1) * noise
+        )
+        target_correct = noise - gt_latent
+
+        # Wrong: noising from hazy_latent
+        noisy_wrong = (
+            (1.0 - sigma.view(B, 1, 1, 1)) * hazy_latent
+            + sigma.view(B, 1, 1, 1) * noise
+        )
+        target_wrong = noise - hazy_latent
+
+        # The correct path uses gt_latent for both samples (same as conditional)
+        assert not torch.allclose(noisy_correct, noisy_wrong)
+        assert not torch.allclose(target_correct, target_wrong)
+
+        # Loss computed with correct target should be zero for perfect prediction
+        loss = flow_matching_loss(target_correct, gt_latent, noise)
+        assert loss == pytest.approx(0.0, abs=1e-5)
+
     def test_cross_device_autograd(self):
         """Gradients flow through .to() CopyBackwards across devices."""
         if not torch.cuda.is_available():

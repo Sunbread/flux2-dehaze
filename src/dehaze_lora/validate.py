@@ -73,7 +73,7 @@ def _denoise_all_modes(
     device: str = "cuda",
     noise_seed: int = 42,
 ) -> DenoiseOutput:
-    """Run 3 denoising trajectories from shared noise: cond, reconstruction, CFG."""
+    """Run 3 denoising trajectories from shared noise: cond, uncond, CFG."""
     B = int(hazy_latent.shape[0])
     ph = int(hazy_latent.shape[2])
     pw = int(hazy_latent.shape[3])
@@ -124,17 +124,17 @@ def _denoise_all_modes(
         z_cond = sched.step(v, t, z_cond).prev_sample
     cond_img = decode_vae_image(vae, z_cond)
 
-    # --- Mode 2: Reconstruction (uncond only) ---
+    # --- Mode 2: Unconditional dehaze anchor (empty prompt) ---
     sched = _fresh_scheduler()
-    z_recon = z0.clone()
-    for t in tqdm(sched.timesteps, desc="Recon", leave=False):
+    z_uncond = z0.clone()
+    for t in tqdm(sched.timesteps, desc="Uncond", leave=False):
         timestep = (
             t.float().unsqueeze(0).expand(B)
             .to(device=device, dtype=torch.bfloat16)
             / scheduler.config.num_train_timesteps
         )
         noisy_tokens, noisy_ids = patchify_and_make_ids(
-            z_recon, patch_size=patch_size, index=0.0,
+            z_uncond, patch_size=patch_size, index=0.0,
         )
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             v = transformer(
@@ -147,8 +147,8 @@ def _denoise_all_modes(
             )[0]
         v = v[:, : noisy_tokens.shape[1], :]
         v = unpatchify(v, ph, pw, patch_size=patch_size)
-        z_recon = sched.step(v, t, z_recon).prev_sample
-    recon_img = decode_vae_image(vae, z_recon)
+        z_uncond = sched.step(v, t, z_uncond).prev_sample
+    uncond_img = decode_vae_image(vae, z_uncond)
 
     # --- Mode 3: CFG ---
     sched = _fresh_scheduler()
@@ -193,7 +193,7 @@ def _denoise_all_modes(
         z_cfg = sched.step(v_cfg, t, z_cfg).prev_sample
     cfg_img = decode_vae_image(vae, z_cfg)
 
-    return {"cond": cond_img, "reconstruction": recon_img, "cfg": cfg_img}
+    return {"cond": cond_img, "uncond": uncond_img, "cfg": cfg_img}
 
 
 @torch.no_grad()
@@ -300,7 +300,7 @@ def run_validation_batch(
             "hazy": hazy_batch[i].cpu(),
             "gt": gt_batch[i],
             "cond": results["cond"][i].cpu(),
-            "reconstruction": results["reconstruction"][i].cpu(),
+            "uncond": results["uncond"][i].cpu(),
             "cfg": results["cfg"][i].cpu(),
         })
 

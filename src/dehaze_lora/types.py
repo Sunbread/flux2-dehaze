@@ -31,7 +31,7 @@ class ValidationImageOutput(TypedDict):
     hazy: torch.Tensor
     gt: torch.Tensor
     cond: torch.Tensor
-    reconstruction: torch.Tensor
+    uncond: torch.Tensor
     cfg: torch.Tensor
 
 
@@ -48,7 +48,7 @@ class MetricsDict(TypedDict):
 
 class DenoiseOutput(TypedDict):
     cond: torch.Tensor
-    reconstruction: torch.Tensor
+    uncond: torch.Tensor
     cfg: torch.Tensor
 
 

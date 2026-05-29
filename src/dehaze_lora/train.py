@@ -314,7 +314,7 @@ def train(
                         img_dict["hazy"],
                         img_dict["gt"],
                         img_dict["cond"],
-                        img_dict["reconstruction"],
+                        img_dict["uncond"],
                         img_dict["cfg"],
                     ], dim=2)  # horizontal concatenation
                     comparison = (
@@ -406,8 +406,11 @@ def train(
                 gt_latent.shape, generator=rng,
                 device=transformer_device, dtype=torch.bfloat16,
             )
+            # Caption dropout removes only text. The flow target remains GT clear image Y,
+            # so empty prompt learns p(Y | I), not p(I | I).
+            target_latent = gt_latent
             noisy_latent = (
-                (1.0 - sigmas.view(bsz, 1, 1, 1)) * gt_latent
+                (1.0 - sigmas.view(bsz, 1, 1, 1)) * target_latent
                 + sigmas.view(bsz, 1, 1, 1) * noise
             )
 
@@ -442,7 +445,7 @@ def train(
                     patch_size=patch_size,
                 )
 
-                loss = flow_matching_loss(v_theta, gt_latent, noise)
+                loss = flow_matching_loss(v_theta, target_latent, noise)
                 loss_scaled = loss / grad_accum  # normalize for accumulation
 
             loss_scaled.backward()

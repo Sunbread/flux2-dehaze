@@ -20,12 +20,13 @@ Fine-tuning Black Forest Labs' FLUX.2 Klein (9B) transformer via LoRA for image 
 ```
 src/dehaze_lora/
   __init__.py     # Package marker
+  types.py        # TypedDicts (DatasetItem, ValidationImageOutput, etc.), TypeAlias (PathInput, LoraTarget)
   model.py        # Model loading, LoRA injection, VAE encode/decode, text encoding, patchify/unpatchify
   loss.py         # Flow-matching MSE loss: target = noise - clean_latent
   optimizer.py    # Muon optimizer wrapper (2D-param constraint, match_rms_adamw LR adjustment)
   train.py        # Training loop with raw PyTorch, gradient accumulation, checkpointing, wandb logging
   validate.py     # Inference with three-mode denoising, PSNR/SSIM evaluation
-  dataset.py      # DehazeDataset (10% caption dropout for CFG) and DehazeValDataset
+  dataset.py      # DehazeDataset (10% caption dropout for CFG), DehazeValDataset (tests only), DEHAZE_PROMPT
   preprocess.py   # RESIDE and NH-HAZE dataset preprocessing pipeline
   checkpoint.py   # Checkpoint save/load with RNG state capture and training resume
   utils.py        # YAML config load/save
@@ -51,7 +52,7 @@ validate.py runs three denoising trajectories from the same noise seed and refer
 
 **Mode 1 — Conditional generation** (no CFG): prompt-only denoising (`v = transformer(z + ref, cond_prompt)`).
 
-**Mode 2 — Reconstruction** (unconditional): empty-prompt-only denoising (`v = transformer(z + ref, empty_prompt)`).
+**Mode 2 — Unconditional dehaze anchor** (uncond): empty-prompt-only denoising (`v = transformer(z + ref, empty_prompt)`). This learns p(Y | I), not p(I | I) — caption dropout removes only text; the flow target remains GT clear image.
 
 **Mode 3 — CFG (classifier-free guidance)**:
 ```
@@ -106,7 +107,7 @@ These come from the actual FLUX.2 Klein model config and ComfyUI source. Changin
 
 | Constant | Value |
 |----------|-------|
-| `DEHAZE_PROMPT` | Fixed 50+ word prompt in `dataset.py:7-14` — used for both training and validation |
+| `DEHAZE_PROMPT` | Fixed 50+ word prompt in `dataset.py:13-20` — used for both training and validation |
 
 ### LoRA Target Modules
 | Model | Modules |
@@ -155,8 +156,10 @@ if lora_target not in ("transformer", "qwen", "both"):
 ### 6. Config Wiring -- Every Key Must Have a Consumer
 Past bugs: `target_size` accepted by dataset constructor but never passed from config; `guidance_scale`/`num_inference_steps` in config.yaml not read by validate(). Every config key must be read somewhere. If you add a new config key, verify end-to-end that it reaches its consumer.
 
-### 7. VAE `eval()` in Validation
-`load_inference_models` in `validate.py` must call `vae.eval()`. The VAE has BatchNorm layers whose running stats drift in training mode even under `no_grad()`, corrupting decode quality across multi-image validation runs.
+Also: code defaults for config values can silently diverge from config.yaml. Example: `qwen_lr` config value is `1e-4` but `train.py:216` has `config.get("qwen_lr", 1e-3)` — if the key is accidentally deleted from config, the fallback is 10x higher. Keep code defaults in sync with config.yaml.
+
+### 7. VAE `eval()` in Validation AND Training
+`load_inference_models` in `validate.py` must call `vae.eval()` AND `transformer.eval()` — both have BatchNorm layers whose running stats drift in training mode even under `no_grad()`, corrupting decode quality across multi-image validation runs. `vae.eval()` is also set in `train.py:117` after model loading.
 
 ### 8. Timestep Shape Is (B,) Not (B, 1)
 The Flux2 transformer expects 1D timestep tensors of shape (B,). Passing `.unsqueeze(1)` -- shape (B, 1) -- will silently cause shape errors downstream.
@@ -196,6 +199,7 @@ tests/
   test_metrics.py          # CPU: PSNR/SSIM calculations
   test_utils.py            # CPU: config loading utilities
   test_validation.py       # CPU: validation split logic, subset selection, RNG isolation
+  test_type_boundaries.py  # CPU: type coercion correctness at module boundaries
 ```
 
 ### Test Categories
@@ -267,7 +271,7 @@ Without gradient checkpointing, transformer activations would be ~8 GB, adding ~
 
 Without Flash Attention, each transformer attention layer stores a 32-head × 2560² attention matrix (~420 MB per block × 32 blocks = ~13 GB). With Flash Attention this is eliminated — only Q/K/V projections are stored. The above estimates assume Flash Attention is active.
 
-Activations scale roughly linearly with batch_size. With bs=2 (current default), `both` mode peaks at ~50 GB, leaving ~30 GB headroom on 80 GB.
+Activations scale roughly linearly with batch_size. With bs=4 (current default), `both` mode peaks at ~54 GB, leaving ~26 GB headroom on 80 GB. For single-GPU override (bs=2), `both` mode peaks at ~46 GB.
 
 ## Code Conventions
 

@@ -116,6 +116,67 @@ def _select_val_subset(
     return [val_metadata[i] for i in ranked[:k]]
 
 
+def _lora_target_flags(lora_target: str) -> tuple[bool, bool]:
+    if lora_target not in ("transformer", "qwen", "both"):
+        raise ValueError(
+            f"Invalid lora_target={lora_target!r}, "
+            f"expected one of: transformer, qwen, both"
+        )
+    return lora_target in ("transformer", "both"), lora_target in ("qwen", "both")
+
+
+def _make_wandb_run_name(
+    lora_target: str,
+    lora_rank: int,
+    transformer_lr: float,
+    qwen_lr: float,
+    seed: int,
+) -> str:
+    t_has_lora, q_has_lora = _lora_target_flags(lora_target)
+    parts = [lora_target, f"r{int(lora_rank)}"]
+    if t_has_lora:
+        parts.append(f"tlr{transformer_lr}")
+    if q_has_lora:
+        parts.append(f"qlr{qwen_lr}")
+    parts.append(f"seed{seed}")
+    return "_".join(parts)
+
+
+def _build_train_log_dict(
+    avg_loss: float,
+    cond_ratio: float,
+    global_step: int,
+    transformer_opt: Any,
+    qwen_opt: Any,
+) -> dict[str, float | int]:
+    log_dict: dict[str, float | int] = {
+        "train/loss": avg_loss,
+        "train/cond_ratio": cond_ratio,
+        "train/step": global_step,
+    }
+    if transformer_opt is not None:
+        log_dict["train/transformer_lr"] = transformer_opt.param_groups[0]["lr"]
+    if qwen_opt is not None:
+        log_dict["train/qwen_lr"] = qwen_opt.param_groups[0]["lr"]
+    return log_dict
+
+
+def _set_training_modes(
+    transformer: Any,
+    text_encoder: Any,
+    t_has_lora: bool,
+    q_has_lora: bool,
+) -> None:
+    if t_has_lora:
+        transformer.train()
+    else:
+        transformer.eval()
+    if q_has_lora:
+        text_encoder.train()
+    else:
+        text_encoder.eval()
+
+
 def train(
     config: dict[str, Any],
     output_dir: str = "outputs/checkpoints",
@@ -123,6 +184,8 @@ def train(
 ) -> None:
     transformer_device = str(config.get("transformer_device", "cuda:0"))
     qwen_device = str(config.get("qwen_device", "cuda:1"))
+    lora_target = str(config.get("lora_target", "both"))
+    t_has_lora, q_has_lora = _lora_target_flags(lora_target)
 
     # ---- Fixed seed ----
     seed = int(config.get("seed", 42))
@@ -146,7 +209,7 @@ def train(
     # ---- Load models ----
     models = load_models(
         model_name=str(config["model_name"]),
-        lora_target=str(config.get("lora_target", "both")),
+        lora_target=lora_target,
         lora_rank=int(config.get("lora_rank", 16)),
         lora_alpha=int(config.get("lora_alpha", 8)),
         transformer_device=transformer_device,
@@ -159,6 +222,7 @@ def train(
     text_encoder = models["text_encoder"]
     tokenizer = models["tokenizer"]
     vae.eval()
+    _set_training_modes(transformer, text_encoder, t_has_lora, q_has_lora)
 
     # Read transformer config
     transformer_config = transformer.config
@@ -177,10 +241,13 @@ def train(
         # Reload LoRA weights
         base_transformer = transformer.get_base_model() if isinstance(transformer, PeftModel) else transformer
         base_qwen = text_encoder.get_base_model() if isinstance(text_encoder, PeftModel) else text_encoder
-        if (ckpt_dir / "transformer_lora").exists():
+        if t_has_lora and (ckpt_dir / "transformer_lora").exists():
             transformer = PeftModel.from_pretrained(base_transformer, str(ckpt_dir / "transformer_lora"))
-        if (ckpt_dir / "qwen_lora").exists():
+            transformer.to(transformer_device)
+        if q_has_lora and (ckpt_dir / "qwen_lora").exists():
             text_encoder = PeftModel.from_pretrained(base_qwen, str(ckpt_dir / "qwen_lora"))
+            text_encoder.to(qwen_device)
+        _set_training_modes(transformer, text_encoder, t_has_lora, q_has_lora)
 
         if global_step >= config["max_steps"]:
             print(f"Resumed at step {global_step} >= max_steps={config['max_steps']}. Training already complete.")
@@ -242,22 +309,13 @@ def train(
     )
 
     # ---- Optimizers ----
-    lora_target: str = config.get("lora_target", "both")
-    if lora_target not in ("transformer", "qwen", "both"):
-        raise ValueError(
-            f"Invalid lora_target={lora_target!r}, "
-            f"expected one of: transformer, qwen, both"
-        )
     transformer_lr = float(config.get("transformer_lr", 1e-3))
-    qwen_lr = float(config.get("qwen_lr", 1e-3))
+    qwen_lr = float(config.get("qwen_lr", 1e-4))
     wd = float(config.get("weight_decay", 0.01))
     momentum = float(config.get("momentum", 0.95))
     transformer_grad_clip = float(config.get("transformer_grad_clip", 1.0))
     qwen_grad_clip = float(config.get("qwen_grad_clip", 1.0))
     warmup_steps = int(config.get("warmup_steps", 0))
-
-    t_has_lora = lora_target in ("transformer", "both")
-    q_has_lora = lora_target in ("qwen", "both")
 
     transformer_opt = create_optimizer(
         transformer, lr=transformer_lr, weight_decay=wd, momentum=momentum
@@ -287,11 +345,12 @@ def train(
     # ---- wandb ----
     import wandb
 
-    exp_name = (
-        f"{lora_target}_"
-        f"r{int(config.get('lora_rank', 16))}_"
-        f"tlr{transformer_lr}_qlr{qwen_lr}_"
-        f"seed{seed}"
+    exp_name = _make_wandb_run_name(
+        lora_target=lora_target,
+        lora_rank=int(config.get("lora_rank", 16)),
+        transformer_lr=transformer_lr,
+        qwen_lr=qwen_lr,
+        seed=seed,
     )
     wandb.init(
         project=str(config.get("wandb_project", "dehaze-flux2-klein")),
@@ -316,8 +375,7 @@ def train(
 
             # Models to eval mode for validation
             transformer.eval()
-            if isinstance(text_encoder, PeftModel):
-                text_encoder.eval()
+            text_encoder.eval()
 
             val_results = run_validation_batch(
                 vae=vae,
@@ -335,9 +393,7 @@ def train(
             )
 
             # Restore train mode
-            transformer.train()
-            if isinstance(text_encoder, PeftModel):
-                text_encoder.train()
+            _set_training_modes(transformer, text_encoder, t_has_lora, q_has_lora)
             # VAE stays eval (never trained, BatchNorm in eval)
 
             # Restore RNG (validation consumed RNG state)
@@ -509,14 +565,13 @@ def train(
 
                 if global_step % log_freq == 0:
                     cond_ratio = float(1.0 - step_uncond / max(step_total, 1))
-                    log_dict = {
-                        "train/loss": avg_loss,
-                        "train/cond_ratio": cond_ratio,
-                        "train/transformer_lr": transformer_opt.param_groups[0]['lr'] if transformer_opt is not None else 0.0,
-                        "train/step": global_step,
-                    }
-                    if qwen_opt is not None:
-                        log_dict["train/qwen_lr"] = qwen_opt.param_groups[0]['lr']
+                    log_dict = _build_train_log_dict(
+                        avg_loss=avg_loss,
+                        cond_ratio=cond_ratio,
+                        global_step=global_step,
+                        transformer_opt=transformer_opt,
+                        qwen_opt=qwen_opt,
+                    )
                     wandb.log(log_dict, step=global_step)
 
                 step_uncond = 0

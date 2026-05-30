@@ -11,7 +11,11 @@ import torch
 from dehaze_lora.loss import flow_matching_loss
 from dehaze_lora.model import patchify_and_make_ids, unpatchify
 from dehaze_lora.optimizer import create_optimizer
-from dehaze_lora.train import _make_noisy_latent
+from dehaze_lora.train import (
+    _build_train_log_dict,
+    _make_noisy_latent,
+    _make_wandb_run_name,
+)
 from tests.conftest import _require_vram_gb, _require_cuda, cleanup_gpu, \
     load_flux2_transformer, MODEL_NAME
 
@@ -19,6 +23,40 @@ from tests.conftest import _require_vram_gb, _require_cuda, cleanup_gpu, \
 # ---------------------------------------------------------------------------
 # Synthetic training step (CPU — tests core logic)
 # ---------------------------------------------------------------------------
+
+class _FakeOpt:
+    def __init__(self, lr):
+        self.param_groups = [{"lr": lr}]
+
+
+class TestWandbModeLogging:
+
+    def test_run_name_only_includes_active_lrs(self):
+        assert _make_wandb_run_name("qwen", 16, 1e-3, 1e-4, 42) == "qwen_r16_qlr0.0001_seed42"
+        assert _make_wandb_run_name("transformer", 16, 1e-3, 1e-4, 42) == "transformer_r16_tlr0.001_seed42"
+        assert _make_wandb_run_name("both", 16, 1e-3, 1e-4, 42) == "both_r16_tlr0.001_qlr0.0001_seed42"
+
+    def test_train_log_only_includes_active_lr_metrics(self):
+        qwen_log = _build_train_log_dict(
+            avg_loss=1.5,
+            cond_ratio=0.75,
+            global_step=10,
+            transformer_opt=None,
+            qwen_opt=_FakeOpt(1e-4),
+        )
+        assert "train/qwen_lr" in qwen_log
+        assert "train/transformer_lr" not in qwen_log
+
+        transformer_log = _build_train_log_dict(
+            avg_loss=1.5,
+            cond_ratio=0.75,
+            global_step=10,
+            transformer_opt=_FakeOpt(1e-3),
+            qwen_opt=None,
+        )
+        assert "train/transformer_lr" in transformer_log
+        assert "train/qwen_lr" not in transformer_log
+
 
 class TestSyntheticTrainingStep:
 

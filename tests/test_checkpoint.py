@@ -372,13 +372,12 @@ class TestCheckpointResume:
                 )
 
     def test_save_checkpoint_cpu(self, tmp_dir):
-        """save_checkpoint writes all expected files with fake objects."""
-        fake_transformer = FakePeftModelForSave()
+        """save_checkpoint writes state/config even when no adapters exist."""
         ckpt_dir = tmp_dir / "checkpoints"
 
         rng_state = get_rng_state()
         save_checkpoint(
-            transformer=fake_transformer,
+            transformer=torch.nn.Linear(2, 2),
             text_encoder="not_peft",  # not a PeftModel -> no qwen_lora dir
             step=100,
             output_dir=str(ckpt_dir),
@@ -392,11 +391,11 @@ class TestCheckpointResume:
 
         saved = ckpt_dir / "checkpoint-100"
         assert saved.exists()
-        assert (saved / "transformer_lora").exists()
         assert (saved / "training_state.pt").exists()
         assert (saved / "config.yaml").exists()
 
-        # qwen_lora should NOT exist (text_encoder is not PeftModel)
+        # Adapter dirs should only exist for real PeftModel instances.
+        assert not (saved / "transformer_lora").exists()
         assert not (saved / "qwen_lora").exists()
 
         # Verify training_state.pt contents
@@ -410,8 +409,60 @@ class TestCheckpointResume:
         config = load_config(saved / "config.yaml")
         assert config == {"key": "value"}
 
+    def test_save_checkpoint_with_transformer_lora_only(self, tmp_dir):
+        """transformer mode saves only transformer_lora."""
+        from dehaze_lora.model import _inject_lora
+        from tests.conftest import TinyAttention
+
+        trans = _inject_lora(TinyAttention(), rank=4, alpha=8, target_modules=["to_q", "to_k"])
+        ckpt_dir = tmp_dir / "checkpoints"
+
+        save_checkpoint(
+            transformer=trans,
+            text_encoder="not_peft",
+            step=25,
+            output_dir=str(ckpt_dir),
+            global_step=25,
+            micro_step=100,
+            rng_state=get_rng_state(),
+            transformer_opt=None,
+            qwen_opt=None,
+            config={"lr": 1e-3},
+        )
+
+        saved = ckpt_dir / "checkpoint-25"
+        assert (saved / "transformer_lora").exists()
+        assert not (saved / "qwen_lora").exists()
+        assert (saved / "training_state.pt").exists()
+
+    def test_save_checkpoint_with_qwen_lora_only(self, tmp_dir):
+        """qwen mode saves only qwen_lora."""
+        from dehaze_lora.model import _inject_lora
+        from tests.conftest import TinyQwenAttention
+
+        qwen = _inject_lora(TinyQwenAttention(), rank=4, alpha=8, target_modules=["q_proj", "v_proj"])
+        ckpt_dir = tmp_dir / "checkpoints"
+
+        save_checkpoint(
+            transformer=torch.nn.Linear(2, 2),
+            text_encoder=qwen,
+            step=30,
+            output_dir=str(ckpt_dir),
+            global_step=30,
+            micro_step=120,
+            rng_state=get_rng_state(),
+            transformer_opt=None,
+            qwen_opt=None,
+            config={"lr": 1e-4},
+        )
+
+        saved = ckpt_dir / "checkpoint-30"
+        assert not (saved / "transformer_lora").exists()
+        assert (saved / "qwen_lora").exists()
+        assert (saved / "training_state.pt").exists()
+
     def test_save_checkpoint_with_qwen_lora(self, tmp_dir):
-        """save_checkpoint creates qwen_lora dir when text_encoder is PeftModel."""
+        """both mode creates both adapter dirs."""
         from dehaze_lora.model import _inject_lora
         from tests.conftest import TinyAttention, TinyQwenAttention
 

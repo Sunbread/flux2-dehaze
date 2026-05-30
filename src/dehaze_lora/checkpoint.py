@@ -61,7 +61,7 @@ def save_checkpoint(
 
     Directory structure:
       checkpoint-{step}/
-        transformer_lora/      (save_pretrained)
+        transformer_lora/      (if transformer is PeftModel)
         qwen_lora/             (if text_encoder is PeftModel)
         training_state.pt      (counters + RNG + optimizer states)
         config.yaml            (snapshot of training config)
@@ -69,7 +69,8 @@ def save_checkpoint(
     ckpt_dir = Path(output_dir) / f"checkpoint-{step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    transformer.save_pretrained(ckpt_dir / "transformer_lora")
+    if isinstance(transformer, PeftModel):
+        transformer.save_pretrained(ckpt_dir / "transformer_lora")
 
     if isinstance(text_encoder, PeftModel):
         text_encoder.save_pretrained(ckpt_dir / "qwen_lora")
